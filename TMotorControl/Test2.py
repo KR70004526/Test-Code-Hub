@@ -288,9 +288,24 @@ def run_server(args):
 
 
 def run_client(args):
-    # writer로 열기: server가 FIFO open(read)하기 전이면 block될 수 있음
     print("Commands: K=.. B=.. pos=.. vel=.. iq=.. tor=.. full=0|1 | zero | quit")
+    waited = 0.0
+    # FIFO가 생길 때까지 대기
+    while not Path(FIFO_PATH).exists():
+        if waited == 0.0:
+            print("[client] waiting for FIFO to appear... (start server or use --mode spawn)")
+        time.sleep(0.2)
+        waited += 0.2
+        if waited >= 10.0:
+            print("[client] still waiting... creating FIFO locally.")
+            try:
+                ensure_fifo(FIFO_PATH)
+            except Exception as e:
+                print(f"[client] ensure_fifo error: {e}")
+                waited = 0.0
+
     try:
+        print("[client] opening FIFO for writing... (may wait until server opens reader)")
         with open(FIFO_PATH, "w") as fw:
             while True:
                 try:
@@ -304,9 +319,10 @@ def run_client(args):
                 if line.lower() in ("quit", "exit"):
                     print("bye")
                     break
-    except FileNotFoundError:
-        print("FIFO not found. Start server first or use --mode spawn.")
-        sys.exit(1)
+    except Exception as e:
+        print(f"[client] error: {e}")
+        input("Press Enter to close...")
+
 
 
 def run_spawn(args):
@@ -315,20 +331,38 @@ def run_spawn(args):
         print("No terminal emulator found. Install lxterminal or xterm or gnome-terminal.")
         sys.exit(1)
 
-    here = Path(__file__).resolve().parent
-    server_cmd = f'python3 -u "{here / Path(__file__).name}" --mode server --type {args.type} --id {args.id} --hz {args.hz} --csv "{args.csv}"'
-    client_cmd = f'python3 -u "{here / Path(__file__).name}" --mode client'
+    # 1) FIFO를 먼저 만들어 레이스 방지
+    try:
+        ensure_fifo(FIFO_PATH)
+    except Exception as e:
+        print(f"[spawn] ensure_fifo error: {e}")
 
-    print("[spawn] launching two windows...")
+    here = Path(__file__).resolve().parent
+    py = f'python3 -u "{here / Path(__file__).name}"'
+
+    # 2) 표준출력/에러를 로그 파일로 남김(원인 파악 쉬움)
+    server_raw = f'{py} --mode server --type {args.type} --id {args.id} --hz {args.hz} --csv "{args.csv}" 2>&1 | tee -a server.log'
+    client_raw = f'{py} --mode client 2>&1 | tee -a client.log'
+
+    # 3) 창이 바로 닫히지 않도록 hold 동작 추가
+    hold_tail = '; echo; echo "[press Enter to close]"; read -r _'
+
     if term == "lxterminal":
-        os.system(f'lxterminal -t "Motor Output" -e {wrap_in_shell(server_cmd)} &')
-        os.system(f'lxterminal -t "Motor Input"  -e {wrap_in_shell(client_cmd)} &')
+        os.system(f'lxterminal -t "Motor Output" -e {wrap_in_shell(server_raw + hold_tail)} &')
+        time.sleep(0.6)  # 서버가 FIFO 읽기로 열 시간 확보
+        os.system(f'lxterminal -t "Motor Input"  -e {wrap_in_shell(client_raw + hold_tail)} &')
+
     elif term == "xterm":
-        os.system(f'xterm -T "Motor Output" -e {wrap_in_shell(server_cmd)} &')
-        os.system(f'xterm -T "Motor Input"  -e {wrap_in_shell(client_cmd)} &')
+        # xterm은 -hold 옵션 지원
+        os.system(f'xterm -T "Motor Output" -hold -e {wrap_in_shell(server_raw)} &')
+        time.sleep(0.6)
+        os.system(f'xterm -T "Motor Input"  -hold -e {wrap_in_shell(client_raw)} &')
+
     else:  # gnome-terminal
-        os.system(f'gnome-terminal --title="Motor Output" -- {server_cmd} &')
-        os.system(f'gnome-terminal --title="Motor Input"  -- {client_cmd} &')
+        # gnome-terminal은 -- bash -lc "<cmd>" 형태로, hold는 쉘에서 구현
+        os.system(f'gnome-terminal --title="Motor Output" -- bash -lc {shlex.quote(server_raw + hold_tail)} &')
+        time.sleep(0.6)
+        os.system(f'gnome-terminal --title="Motor Input"  -- bash -lc {shlex.quote(client_raw + hold_tail)} &')
 
 
 # ---------------------- main ----------------------
