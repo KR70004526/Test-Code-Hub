@@ -32,10 +32,20 @@ import csv
 import shlex
 import time
 import stat
+import math
 import argparse
 import threading
 from pathlib import Path
 from typing import Optional, Dict
+
+# ---------- 경로(절대) 고정 & sys.path 보강 ----------
+BASE_DIR = Path(__file__).resolve().parent
+FIFO_PATH = str(BASE_DIR / "cmd.fifo")  # 상대경로 문제 방지
+
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+if str(BASE_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR.parent))
 
 # ---- 외부 라이브러리 ----
 try:
@@ -44,11 +54,23 @@ try:
 except Exception:
     HAVE_SRL = False
 
-from TMotorCANControl import TMotorManager_mit_can, MIT_Params
+try:
+    from TMotorCANControl import TMotorManager_mit_can, MIT_Params
+except ModuleNotFoundError:
+    print("[import] Could not import TMotorCANControl.\n"
+          f"python={sys.executable}\n"
+          f"sys.path[0]={sys.path[0]}\n"
+          f"BASE_DIR={BASE_DIR}\n"
+          f"BASE_DIR.parent={BASE_DIR.parent}",
+          file=sys.stderr)
+    raise
 
-# ---- 경로(절대) 고정 ----
-BASE_DIR = Path(__file__).resolve().parent
-FIFO_PATH = str(BASE_DIR / "cmd.fifo")  # 상대경로로 인한 spawn/작업폴더 불일치 방지
+# numpy가 있으면 CSV 안전 변환에 활용
+try:
+    import numpy as np
+    _HAVE_NP = True
+except Exception:
+    _HAVE_NP = False
 
 
 # ---------------------- 유틸 ----------------------
@@ -98,6 +120,31 @@ def wrap_in_shell(cmd: str) -> str:
     return f"bash -lc {shlex.quote(cmd)}"
 
 
+def _csv_safe(x):
+    """CSV에 안전하게 넣기: None/NaN/넘파이 스칼라 대응"""
+    if x is None:
+        return ""
+    if _HAVE_NP:
+        try:
+            if isinstance(x, (np.floating, np.integer)):
+                x = x.item()
+            elif isinstance(x, np.ndarray) and x.size == 1:
+                x = x.item()
+        except Exception:
+            pass
+    if isinstance(x, float) and not math.isfinite(x):
+        return ""
+    return x
+
+
+def _fmt_float(x, fmt="{:+.3f}"):
+    """숫자면 지정 포맷, 아니면 그대로 문자열화"""
+    try:
+        return fmt.format(float(x))
+    except Exception:
+        return str(x)
+
+
 # ---------------------- 컨트롤러 ----------------------
 class FullStateController:
     """
@@ -131,7 +178,8 @@ class FullStateController:
                 kd_min = MIT_Params[self.m.type]['Kd_min']
                 kd_max = MIT_Params[self.m.type]['Kd_max']
                 K_eff = max(kp_min, min(K_eff, kp_max))
-                B_eff = max(kd_min, min(B_eff, kd_max))
+                B_eff = max(dk if (dk := kd_min) is not None else B_eff,
+                            min(B_eff, kd_max if kd_max is not None else B_eff))
 
             # 게인/모드 적용
             if full_state:
@@ -245,7 +293,7 @@ def run_server(args):
         # 초기 안전값
         ctrl.update_full_state(K=5.0, B=0.1, pos=0.0, vel=0.0, iq=0.0, full_state=True)
 
-        # CSV 로깅 준비
+        # CSV 로깅 준비 (스크립트 폴더 기준으로 저장)
         csv_path = Path(args.csv)
         if not csv_path.is_absolute():
             csv_path = BASE_DIR / csv_path
@@ -261,7 +309,8 @@ def run_server(args):
         th.start()
 
         # 루프 선택: SoftRealtimeLoop or fallback
-        loop_iter = SoftRealtimeLoop(dt=1.0/float(args.hz), report=True, fade=0.0) if HAVE_SRL else soft_loop(1.0/float(args.hz))
+        loop_iter = SoftRealtimeLoop(dt=1.0/float(args.hz),
+                                     report=True, fade=0.0) if HAVE_SRL else soft_loop(1.0/float(args.hz))
 
         print("[server] running. type commands in the client window (or `quit`).")
         for t in loop_iter:
@@ -273,14 +322,28 @@ def run_server(args):
 
             # 상태 기록
             st = ctrl.read_state()
-            csv_w.writerow([f"{time.perf_counter()-t0:.6f}", st["pos"], st["vel"], st["acc"],
-                            st["iq"], st["torque"], st["temp"], int(st["err"])"])
+            csv_w.writerow([
+                f"{time.perf_counter()-t0:.6f}",
+                _csv_safe(st.get("pos")),
+                _csv_safe(st.get("vel")),
+                _csv_safe(st.get("acc")),
+                _csv_safe(st.get("iq")),
+                _csv_safe(st.get("torque")),
+                _csv_safe(st.get("temp")),
+                _csv_safe(st.get("err")),
+            ])
 
             # 출력/flush: 10Hz
             if (t - last_print) >= 0.1:
-                print(f"\rpos={st['pos']:+.3f} vel={st['vel']:+.3f} iq={st['iq']:+.3f} "
-                      f"tor={st['torque']:+.3f} temp={st['temp']:.1f}C err={int(st['err'])}  ",
-                      end="", flush=True)
+                print(
+                    f"\rpos={_fmt_float(st.get('pos'))} "
+                    f"vel={_fmt_float(st.get('vel'))} "
+                    f"iq={_fmt_float(st.get('iq'))} "
+                    f"tor={_fmt_float(st.get('torque'))} "
+                    f"temp={_fmt_float(st.get('temp'), fmt='{:.1f}')}C "
+                    f"err={_csv_safe(st.get('err'))}  ",
+                    end="", flush=True
+                )
                 last_print = t
             if (t - last_flush) >= 0.1:
                 csv_fh.flush()
@@ -347,39 +410,49 @@ def run_spawn(args):
     except Exception as e:
         print(f"[spawn] ensure_fifo error: {e}")
 
-    # 2) 절대 경로들 준비
+    # 2) 절대 경로들 준비 + 현재 파이썬(venv) 해석기 사용
     script_path = str((BASE_DIR / Path(__file__).name).resolve())
-    py = f"python3 -u {shlex.quote(script_path)}"
+    py = f"{shlex.quote(sys.executable)} -u {shlex.quote(script_path)}"
     server_log = shlex.quote(str(BASE_DIR / "server.log"))
     client_log = shlex.quote(str(BASE_DIR / "client.log"))
 
-    # 3) 명령 구성 (값만 quote)
+    # 3) PYTHONPATH 주입 (BASE_DIR, 부모 폴더 우선)
+    py_path_parts = []
+    env_pp = os.environ.get("PYTHONPATH")
+    if env_pp:
+        py_path_parts.append(env_pp)
+    py_path_parts.append(str(BASE_DIR))
+    py_path_parts.append(str(BASE_DIR.parent))
+    env_prefix = "PYTHONPATH=" + shlex.quote(":".join(py_path_parts)) + " "
+
+    # 4) 명령 구성 (값만 quote)
+    csv_out = (BASE_DIR / args.csv) if not Path(args.csv).is_absolute() else Path(args.csv)
     server_cmd = (
+        env_prefix +
         f"{py} --mode server "
         f"--type {shlex.quote(args.type)} "
         f"--id {int(args.id)} "
         f"--hz {int(args.hz)} "
-        f"--csv {shlex.quote(str((BASE_DIR / args.csv) if not Path(args.csv).is_absolute() else args.csv))} "
+        f"--csv {shlex.quote(str(csv_out))} "
         f"2>&1 | tee -a {server_log}"
     )
-    client_cmd = f"{py} --mode client 2>&1 | tee -a {client_log}"
+    client_cmd = env_prefix + f"{py} --mode client 2>&1 | tee -a {client_log}"
 
-    # 4) 창이 바로 닫히지 않도록 hold 동작 추가(hold 미지원 터미널 대비)
+    # 5) 창이 바로 닫히지 않도록 hold 동작 추가(hold 미지원 터미널 대비)
     hold_tail = '; echo; echo "[press Enter to close]"; read -r _'
 
     if term == "lxterminal":
         os.system(f'lxterminal -t "Motor Output" -e {wrap_in_shell(server_cmd + hold_tail)} &')
-        time.sleep(0.8)  # 서버가 FIFO 읽기로 열 시간 확보
+        time.sleep(0.8)
         os.system(f'lxterminal -t "Motor Input"  -e {wrap_in_shell(client_cmd + hold_tail)} &')
 
     elif term == "xterm":
-        # xterm은 -hold 지원: 서버/클라 모두 -hold 로 유지
+        # xterm은 -hold 지원
         os.system(f'xterm -T "Motor Output" -hold -e {wrap_in_shell(server_cmd)} &')
         time.sleep(0.8)
         os.system(f'xterm -T "Motor Input"  -hold -e {wrap_in_shell(client_cmd)} &')
 
     elif term in ("xfce4-terminal", "mate-terminal"):
-        # 이 둘은 gnome-terminal과 유사하게 --command 대신 쉘로 전달
         os.system(f'{term} --title="Motor Output" -- bash -lc {shlex.quote(server_cmd + hold_tail)} &')
         time.sleep(0.8)
         os.system(f'{term} --title="Motor Input"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
