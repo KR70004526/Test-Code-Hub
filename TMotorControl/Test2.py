@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -47,7 +46,9 @@ except Exception:
 
 from TMotorCANControl import TMotorManager_mit_can, MIT_Params
 
-FIFO_PATH = "cmd.fifo"
+# ---- 경로(절대) 고정 ----
+BASE_DIR = Path(__file__).resolve().parent
+FIFO_PATH = str(BASE_DIR / "cmd.fifo")  # 상대경로로 인한 spawn/작업폴더 불일치 방지
 
 
 # ---------------------- 유틸 ----------------------
@@ -56,7 +57,10 @@ def ensure_fifo(path: str):
     if p.exists():
         st = p.stat()
         if not stat.S_ISFIFO(st.st_mode):
-            p.unlink(missing_ok=True)
+            try:
+                p.unlink()
+            except Exception:
+                pass
             os.mkfifo(path)
     else:
         os.mkfifo(path)
@@ -79,15 +83,19 @@ def soft_loop(dt: float):
 
 def find_terminal():
     import shutil
-    for term in ("lxterminal", "xterm", "gnome-terminal"):
+    # 라즈비안 보편 + 대체 후보
+    for term in ("lxterminal", "xterm", "gnome-terminal", "xfce4-terminal", "mate-terminal"):
         if shutil.which(term):
             return term
     return None
 
 
 def wrap_in_shell(cmd: str) -> str:
-    # 터미널 -e/-- command 인자에 안전하게 전달
-    return f'bash -lc "{cmd}"'
+    """
+    터미널 -e/-- command 인자에 안전하게 전달.
+    내부에 쌍따옴표가 있어도 전체를 단따옴표로 안전 인용.
+    """
+    return f"bash -lc {shlex.quote(cmd)}"
 
 
 # ---------------------- 컨트롤러 ----------------------
@@ -238,7 +246,10 @@ def run_server(args):
         ctrl.update_full_state(K=5.0, B=0.1, pos=0.0, vel=0.0, iq=0.0, full_state=True)
 
         # CSV 로깅 준비
-        csv_fh = open(args.csv, "w", newline="")
+        csv_path = Path(args.csv)
+        if not csv_path.is_absolute():
+            csv_path = BASE_DIR / csv_path
+        csv_fh = open(csv_path, "w", newline="")
         csv_w = csv.writer(csv_fh)
         csv_w.writerow(["time","pos","vel","acc","iq","torque","temp","err"])
         t0 = time.perf_counter()
@@ -263,7 +274,7 @@ def run_server(args):
             # 상태 기록
             st = ctrl.read_state()
             csv_w.writerow([f"{time.perf_counter()-t0:.6f}", st["pos"], st["vel"], st["acc"],
-                            st["iq"], st["torque"], st["temp"], int(st["err"])])
+                            st["iq"], st["torque"], st["temp"], int(st["err"])"])
 
             # 출력/flush: 10Hz
             if (t - last_print) >= 0.1:
@@ -324,45 +335,59 @@ def run_client(args):
         input("Press Enter to close...")
 
 
-
 def run_spawn(args):
     term = find_terminal()
     if not term:
         print("No terminal emulator found. Install lxterminal or xterm or gnome-terminal.")
         sys.exit(1)
 
-    # 1) FIFO를 먼저 만들어 레이스 방지
+    # 1) FIFO를 먼저 만들어 레이스 방지 (절대경로)
     try:
         ensure_fifo(FIFO_PATH)
     except Exception as e:
         print(f"[spawn] ensure_fifo error: {e}")
 
-    here = Path(__file__).resolve().parent
-    py = f'python3 -u "{here / Path(__file__).name}"'
+    # 2) 절대 경로들 준비
+    script_path = str((BASE_DIR / Path(__file__).name).resolve())
+    py = f"python3 -u {shlex.quote(script_path)}"
+    server_log = shlex.quote(str(BASE_DIR / "server.log"))
+    client_log = shlex.quote(str(BASE_DIR / "client.log"))
 
-    # 2) 표준출력/에러를 로그 파일로 남김(원인 파악 쉬움)
-    server_raw = f'{py} --mode server --type {args.type} --id {args.id} --hz {args.hz} --csv "{args.csv}" 2>&1 | tee -a server.log'
-    client_raw = f'{py} --mode client 2>&1 | tee -a client.log'
+    # 3) 명령 구성 (값만 quote)
+    server_cmd = (
+        f"{py} --mode server "
+        f"--type {shlex.quote(args.type)} "
+        f"--id {int(args.id)} "
+        f"--hz {int(args.hz)} "
+        f"--csv {shlex.quote(str((BASE_DIR / args.csv) if not Path(args.csv).is_absolute() else args.csv))} "
+        f"2>&1 | tee -a {server_log}"
+    )
+    client_cmd = f"{py} --mode client 2>&1 | tee -a {client_log}"
 
-    # 3) 창이 바로 닫히지 않도록 hold 동작 추가
+    # 4) 창이 바로 닫히지 않도록 hold 동작 추가(hold 미지원 터미널 대비)
     hold_tail = '; echo; echo "[press Enter to close]"; read -r _'
 
     if term == "lxterminal":
-        os.system(f'lxterminal -t "Motor Output" -e {wrap_in_shell(server_raw + hold_tail)} &')
-        time.sleep(0.6)  # 서버가 FIFO 읽기로 열 시간 확보
-        os.system(f'lxterminal -t "Motor Input"  -e {wrap_in_shell(client_raw + hold_tail)} &')
+        os.system(f'lxterminal -t "Motor Output" -e {wrap_in_shell(server_cmd + hold_tail)} &')
+        time.sleep(0.8)  # 서버가 FIFO 읽기로 열 시간 확보
+        os.system(f'lxterminal -t "Motor Input"  -e {wrap_in_shell(client_cmd + hold_tail)} &')
 
     elif term == "xterm":
-        # xterm은 -hold 옵션 지원
-        os.system(f'xterm -T "Motor Output" -hold -e {wrap_in_shell(server_raw)} &')
-        time.sleep(0.6)
-        os.system(f'xterm -T "Motor Input"  -hold -e {wrap_in_shell(client_raw)} &')
+        # xterm은 -hold 지원: 서버/클라 모두 -hold 로 유지
+        os.system(f'xterm -T "Motor Output" -hold -e {wrap_in_shell(server_cmd)} &')
+        time.sleep(0.8)
+        os.system(f'xterm -T "Motor Input"  -hold -e {wrap_in_shell(client_cmd)} &')
+
+    elif term in ("xfce4-terminal", "mate-terminal"):
+        # 이 둘은 gnome-terminal과 유사하게 --command 대신 쉘로 전달
+        os.system(f'{term} --title="Motor Output" -- bash -lc {shlex.quote(server_cmd + hold_tail)} &')
+        time.sleep(0.8)
+        os.system(f'{term} --title="Motor Input"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
 
     else:  # gnome-terminal
-        # gnome-terminal은 -- bash -lc "<cmd>" 형태로, hold는 쉘에서 구현
-        os.system(f'gnome-terminal --title="Motor Output" -- bash -lc {shlex.quote(server_raw + hold_tail)} &')
-        time.sleep(0.6)
-        os.system(f'gnome-terminal --title="Motor Input"  -- bash -lc {shlex.quote(client_raw + hold_tail)} &')
+        os.system(f'gnome-terminal --title="Motor Output" -- bash -lc {shlex.quote(server_cmd + hold_tail)} &')
+        time.sleep(0.8)
+        os.system(f'gnome-terminal --title="Motor Input"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
 
 
 # ---------------------- main ----------------------
