@@ -1,31 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_motor_console_setup.py (events-in-CSV)
-- CSV에 명령 이벤트 컬럼 추가: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
+multi_motor_console_setup.py (session-folder + events-in-CSV)
+- 세션 폴더 방식: logs/<SESSION_TAG>/ 아래에 모든 산출물 CSV/로그 저장
+- CSV에 명령 이벤트 컬럼 포함: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
 - 각 ID CSV에는 해당 ID에 적용된 명령만 표시
-- 이벤트는 명령 적용 직후 "다음 샘플 행"에 기록 (END는 즉시 한 줄 기록)
-- 나머지 구조: 클래스화 / 토크-only / FIFO non-blocking / lazy SRL
+- FIFO non-blocking, lazy SoftRealtimeLoop, 상태읽기 락, help 중복 제거 반영
 """
 
 import os, sys, csv, shlex, time, stat, argparse, threading, queue, select
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
+from datetime import datetime
 
-# ---------- 경로/로그 ----------
+# ---------- 경로/세션 ----------
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# 세션 태그/폴더 전역 (spawn 부모 또는 --session-tag로 통일 가능)
+SESSION_TAG = None
+SESSION_DIR: Path = LOG_DIR  # 초기값 (set_session_tag 호출로 갱신)
+
+def set_session_tag(tag: Optional[str] = None):
+    """세션 태그/폴더 설정 (없으면 현재 시각 기반으로 생성)"""
+    global SESSION_TAG, SESSION_DIR
+    if tag is None:
+        tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")  # 마이크로초 포함
+    SESSION_TAG = tag
+    SESSION_DIR = LOG_DIR / SESSION_TAG
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# 최초 기본 세션 설정
+set_session_tag()
+
 def fifo_path_for_bus(bus: str) -> str:
+    # FIFO는 고정 경로(세션과 무관) — 클라이언트가 항상 같은 경로로 접속 가능
     return str(BASE_DIR / f"cmd_{bus}.fifo")
 
 def csv_path_for_motor(bus: str, mid: int) -> Path:
-    return LOG_DIR / f"session_{bus}_id{mid}.csv"
+    return SESSION_DIR / f"session_{bus}_id{mid}.csv"
 
 def cmdlog_path_for_motor(bus: str, mid: int) -> Path:
-    return LOG_DIR / f"cmd_{bus}_id{mid}.log"
+    return SESSION_DIR / f"cmd_{bus}_id{mid}.log"
 
 # ---------- sys.path 보강 ----------
 if str(BASE_DIR) not in sys.path:
@@ -84,6 +102,9 @@ f"""\
 
 CSV 추가 컬럼:
   cmd_text, cmd_kind(cmd|start|end|stop|zero), cmd_recv_epoch(sec), cmd_latency_ms
+
+세션 폴더:
+  {SESSION_DIR}
 """
     )
 
@@ -242,12 +263,11 @@ class CsvRecorder:
         self._w = None
     def open(self):
         exists = self.path.exists() and self.path.stat().st_size > 0
-        self._fh = open(self.path, "a", newline="")
+        self._fh = open(self.path, "w", newline="")  # 새 파일로 작성 (세션 폴더이므로 중복 없음)
         self._w = csv.writer(self._fh)
-        if not exists:
-            self._w.writerow(self.HEADER)
-            # 세션 기준시각 주석(절대시각 복원용)
-            self._fh.write(f"# session_epoch={time.time():.6f}\n")
+        # 세션 기준시각 주석(절대시각 복원용) + 헤더
+        self._fh.write(f"# session_epoch={time.time():.6f}\n")
+        self._w.writerow(self.HEADER)
     def write(self, row: List):
         if self._w: self._w.writerow(row)
     def close(self):
@@ -258,7 +278,8 @@ class CsvRecorder:
 
 class CmdLogger:
     def __init__(self, path: Path):
-        self._fh = open(path, "a", buffering=1)
+        # 세션 폴더이므로 append 필요 없음. 그래도 안전하게 'w'로 새로 연다.
+        self._fh = open(path, "w", buffering=1)
         self._fh.write(f"# cmd log start {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
     def log(self, s: str):
         t = time.time()
@@ -348,6 +369,7 @@ class FifoCommandClient:
                 except Exception as e: print(f"[client:{bus}] ensure_fifo error: {e}"); waited=0.0
         try:
             print(f"[client:{bus}] opening FIFO... (may wait until server opens reader)")
+            print(f"  * 세션 폴더: {SESSION_DIR}")
             print("  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.")
             with open(self.path,"w") as fw:
                 while True:
@@ -457,7 +479,7 @@ class MotorBusServer:
             rt.pending.recv_epoch = min(rt.pending.recv_epoch, recv_epoch)
             rt.pending.recv_rel   = min(rt.pending.recv_rel, recv_rel)
 
-    def _handle_action(self, cmd: Command, raw: RawCmd):
+    def _handle_action(self, cmd: Command, raw: 'RawCmd'):
         if cmd.mixed:
             print("[server] 경고: action과 파라미터를 한 줄에 섞을 수 없습니다. (action만 수행)")
         ids = cmd.ids
@@ -517,7 +539,7 @@ class MotorBusServer:
                 self._schedule_event(mid, "zero", "zero", raw.recv_epoch, raw.recv_rel)
             return
 
-    def _handle_non_action(self, cmd: Command, raw: RawCmd):
+    def _handle_non_action(self, cmd: Command, raw: 'RawCmd'):
         # gains/full
         if cmd.gains or (cmd.full is not None):
             for mid in cmd.ids:
@@ -640,19 +662,37 @@ def run_client(bus: str):
     FifoCommandClient(fifo).run(bus)
 
 def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int):
+    # 부모 프로세스에서 세션 태그를 생성하고 전파
+    tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
+    set_session_tag(tag)
+
     term = find_terminal()
     if not term:
         print("No terminal emulator found. Install lxterminal/xterm/gnome-terminal.")
         sys.exit(1)
+
     script_path = str((BASE_DIR / Path(__file__).name).resolve())
     py = f"{shlex.quote(sys.executable)} -u {shlex.quote(script_path)}"
+
     for bus, id2type in mapping.items():
         idmap_str = ",".join(f"{i}:{t}" for i,t in id2type.items())
-        server_cmd = (f"{py} --mode server --bus {bus} --idmap {shlex.quote(idmap_str)} "
-                      f"--hz {hz} 2>&1 | tee -a {shlex.quote(str(LOG_DIR / f'server_{bus}.log'))}")
-        client_cmd = (f"{py} --mode client --bus {bus} "
-                      f"2>&1 | tee -a {shlex.quote(str(LOG_DIR / f'client_{bus}.log'))}")
+
+        # 세션 폴더 안에 서버/클라 로그를 새 파일로 (append 안 함)
+        server_log = SESSION_DIR / f"server_{bus}.log"
+        client_log = SESSION_DIR / f"client_{bus}.log"
+
+        server_cmd = (
+            f"{py} --mode server --session-tag {shlex.quote(tag)} "
+            f"--bus {bus} --idmap {shlex.quote(idmap_str)} --hz {hz} "
+            f"2>&1 | tee {shlex.quote(str(server_log))}"
+        )
+        client_cmd = (
+            f"{py} --mode client --session-tag {shlex.quote(tag)} "
+            f"--bus {bus} "
+            f"2>&1 | tee {shlex.quote(str(client_log))}"
+        )
         hold_tail = '; echo; echo "[press Enter to close]"; read -r _'
+
         if term=="lxterminal":
             os.system(f'lxterminal -t "Motor Output {bus}" -e {wrap_in_shell(server_cmd + hold_tail)} &')
             time.sleep(0.6)
@@ -667,7 +707,7 @@ def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int):
             os.system(f'gnome-terminal --title="Motor Input {bus}"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
 
 def run_setup(default_hz: int):
-    print("# Setup Wizard")
+    print("# Setup Wizard (세션 폴더 방식)")
     print("버스/ID/타입 입력 → 주파수 설정 → spawn 자동 실행")
     mapping: Dict[str, Dict[int,str]] = {}
     while True:
@@ -704,7 +744,7 @@ def run_setup(default_hz: int):
     except Exception:
         hz = default_hz
 
-    print("\n[안내] 버스별 서버/클라이언트 창을 자동으로 띄웁니다.")
+    print("\n[안내] 한 세션용 폴더를 만들고, 버스별 서버/클라이언트를 자동으로 띄웁니다.")
     yn = input("이 설정으로 spawn 할까요? [Y/n] ").strip().lower()
     if yn in ("", "y", "yes"):
         run_spawn(mapping, hz)
@@ -719,7 +759,12 @@ def main():
     p.add_argument("--bus", default="can0")
     p.add_argument("--idmap", default="", help='server: "1:AK70-10,2:AK80-64"')
     p.add_argument("--map", default="",  help='spawn: "can0:1:AK70-10,2:AK80-64;can1:3:AK80-64"')
+    p.add_argument("--session-tag", default=None, help="세션 태그를 고정(부모 spawn에서 전달)")
     args = p.parse_args()
+
+    # 세션 태그 반영 (spawn 자식/단일 실행에서도 동일 폴더 사용 가능)
+    if args.session_tag:
+        set_session_tag(args.session_tag)
 
     if args.mode == "setup":
         run_setup(args.hz); return
