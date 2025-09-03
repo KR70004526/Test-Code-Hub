@@ -1,0 +1,37 @@
+[client:can0] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help
+[client:can0] opening FIFO... (may wait until server opens reader)
+  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.
+[client:can0] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help
+[client:can0] opening FIFO... (may wait until server opens reader)
+  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.
+[client:can0] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help
+[client:can0] opening FIFO... (may wait until server opens reader)
+  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.
+CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> === Motor Console Help [bus=can0] ===
+
+명령 형식 (한 줄에 여러 key=value 조합 가능):
+  id=<번호|all>  K=<float>  B=<float>  pos=<rad>  vel=<rad/s>  tor=<Nm>  full=<0|1>
+
+제어/유틸:
+  start           - 지정한 id(또는 id=all)의 CSV 기록 시작 (logs/session_<bus>_id<ID>.csv)
+  end             - 지정한 id(또는 id=all)의 CSV 기록 종료
+  stop            - 안전 정지(K=B=0, vel/tor=0, zero)
+  zero            - 지정한 id(또는 id=all)의 현재 위치를 0으로 재설정(영점)
+  help | h | ?    - 이 도움말 출력(클라이언트에서 표시)
+  quit | exit     - 서버 종료 (client에서 보내면 서버도 함께 종료)
+
+예시:
+  id=1 K=20 B=0.5 pos=0.0          # 1번 모터 위치 명령
+  id=2 vel=0.8                     # 2번 모터 속도 명령
+  id=all tor=1.2                   # 모든 모터 토크 명령
+  id=1 start                       # 1번 모터 CSV 기록 시작
+  id=1 end                         # 1번 모터 CSV 기록 종료
+  id=all stop                      # 안전 정지
+  help                             # 도움말
+
+참고:
+- pos 명령은 [-12.5, +12.5] rad 제한(드라이버 프로토콜 상 포화).
+- 속도/토크 모드에서는 멀티턴 누적될 수 있습니다.
+- CSV 기록은 start~end 구간만 저장되며, 모터 ID별 파일로 분리됩니다.
+
+CMD[can0]> bye
