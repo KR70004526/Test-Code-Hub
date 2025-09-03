@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_motor_console_setup.py (refined)
-- 클래스화(Controller/Server/Parser/Recorder/Scheduler)
-- 토크-only (iq 완전 제거)
-- FIFO는 버스별 분리: cmd_{bus}.fifo (절대경로)
-- 명령: id=3 K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | zero | start | end | stop | quit | help
-- MIT_Params는 TMotorCANControl.mit_can에서 import (누락 시 1회 경고)
-- TMotorManager_mit_can 초기화 시 max_mosfett_temp=90
-- CSV는 start~end 구간만 저장, **모터 ID별 별도 파일**
-- 개선점 포함:
-  * help 중복 제거(서버 파서는 출력하지 않음, 클라만 안내)
-  * state() 락 + acceleration 방어(getattr)
-  * stop 순서: K/B=0 → vel/torque=0 → zero() (pos 명령 제거)
-  * FIFO non-blocking + EOF 재오픈 처리
-  * 액션과 파라미터 혼합 시 경고 출력(액션만 수행)
+multi_motor_console_setup.py (events-in-CSV)
+- CSV에 명령 이벤트 컬럼 추가: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
+- 각 ID CSV에는 해당 ID에 적용된 명령만 표시
+- 이벤트는 명령 적용 직후 "다음 샘플 행"에 기록 (END는 즉시 한 줄 기록)
+- 나머지 구조: 클래스화 / 토크-only / FIFO non-blocking / lazy SRL
 """
 
-import os, sys, csv, shlex, time, stat, argparse, threading, math, queue, select
+import os, sys, csv, shlex, time, stat, argparse, threading, queue, select
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -28,7 +19,7 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 def fifo_path_for_bus(bus: str) -> str:
-    return str(BASE_DIR / f"cmd_{bus}.fifo")  # 절대경로
+    return str(BASE_DIR / f"cmd_{bus}.fifo")
 
 def csv_path_for_motor(bus: str, mid: int) -> Path:
     return LOG_DIR / f"session_{bus}_id{mid}.csv"
@@ -53,7 +44,7 @@ def _fmtf(x, fmt="{:+.3f}"):
     try: return fmt.format(float(x))
     except Exception: return str(x)
 
-# ---------- python-can 채널 고정(한 프로세스=한 버스) ----------
+# ---------- python-can 채널 고정 ----------
 def force_socketcan_channel(channel: str):
     try:
         import can
@@ -86,59 +77,50 @@ def help_text(bus_hint: Optional[str]=None) -> str:
 f"""\
 === Motor Console Help {bus_str}===
 
-명령 형식 (한 줄에 여러 key=value 조합 가능):
+명령 형식:
   id=<번호|all>  K=<float>  B=<float>  pos=<rad>  vel=<rad/s>  tor=<Nm>  full=<0|1>
-
 제어/유틸:
-  start           - 지정한 id(또는 id=all)의 CSV 기록 시작 (logs/session_<bus>_id<ID>.csv)
-  end             - 지정한 id(또는 id=all)의 CSV 기록 종료
-  stop            - 안전 정지(K=B=0, vel/tor=0, zero)
-  zero            - 지정한 id(또는 id=all)의 현재 위치를 0으로 재설정(영점)
-  help | h | ?    - 이 도움말 출력(클라이언트에서 표시)
-  quit | exit     - 서버 종료 (client에서 보내면 서버도 함께 종료)
+  start | end | stop | zero | help | quit
 
-예시:
-  id=1 K=20 B=0.5 pos=0.0          # 1번 모터 위치 명령
-  id=2 vel=0.8                     # 2번 모터 속도 명령
-  id=all tor=1.2                   # 모든 모터 토크 명령
-  id=1 start                       # 1번 모터 CSV 기록 시작
-  id=1 end                         # 1번 모터 CSV 기록 종료
-  id=all stop                      # 안전 정지
-  help                             # 도움말
-
-참고:
-- pos 명령은 [-12.5, +12.5] rad 제한(드라이버 프로토콜 상 포화).
-- 속도/토크 모드에서는 멀티턴 누적될 수 있습니다.
-- CSV 기록은 start~end 구간만 저장되며, 모터 ID별 파일로 분리됩니다.
+CSV 추가 컬럼:
+  cmd_text, cmd_kind(cmd|start|end|stop|zero), cmd_recv_epoch(sec), cmd_latency_ms
 """
     )
 
-# ---------- 스케줄러 ----------
+# ---------- 스케줄러 (lazy SRL) ----------
 class RealtimeScheduler:
     def __init__(self, hz: int):
-        self.dt = 1.0/float(hz)
-        self._use_srl = False
-        if HAVE_SRL:
+        self.dt = 1.0 / float(hz)
+        self._use_srl = HAVE_SRL
+        self._srl = None
+        self._iter = None
+        self._t0 = None
+        self._n = 0
+
+    def tick(self):
+        if self._use_srl and self._iter is None:
             try:
                 self._srl = SoftRealtimeLoop(dt=self.dt, report=True, fade=0.0)
                 self._iter = iter(self._srl)
-                self._use_srl = True
             except Exception:
                 self._use_srl = False
-        if not self._use_srl:
-            self._t0 = time.perf_counter()
-            self._n = 0
-    def tick(self):
+
         if self._use_srl:
             return next(self._iter)
+
+        if self._t0 is None:
+            self._t0 = time.perf_counter()
+            self._n = 0
+
         self._n += 1
         tgt = self._t0 + self._n * self.dt
         now = time.perf_counter()
         delay = max(0.0, tgt - now)
-        if delay > 0: time.sleep(delay)
+        if delay > 0:
+            time.sleep(delay)
         return tgt - self._t0
 
-# ---------- 디바이스 컨트롤러 (토크-only) ----------
+# ---------- 디바이스 컨트롤러 ----------
 class MotorController:
     def __init__(self, manager: "TMotorManager_mit_can", motor_type: str,
                  K_init: float=5.0, B_init: float=0.1, full_state: bool=True):
@@ -149,7 +131,7 @@ class MotorController:
         self._full = bool(full_state)
         self._lock = threading.Lock()
         self._warned_missing_type = False
-        self.apply_gains()  # 초기 적용
+        self.apply_gains()
 
     def _clamp(self, K: float, B: float) -> Tuple[float,float]:
         p = MIT_Params.get(self.type) if TMOTOR_OK else None
@@ -193,7 +175,6 @@ class MotorController:
             self.m.update()
 
     def state(self) -> Dict[str, float]:
-        # 락 적용 + acceleration 방어
         with self._lock:
             return {
                 "pos": self.m.position,
@@ -212,22 +193,17 @@ class Command:
     setp : Dict[str, float] = field(default_factory=dict)      # pos,vel,torque
     full : Optional[bool] = None
     action: Optional[str] = None                               # start|end|stop|zero|quit|help
-    mixed: bool = False                                        # action + params 혼합 여부
+    mixed: bool = False
 
 class CommandParser:
     def parse(self, line: str, id_pool: List[int]) -> Optional[Command]:
         s = line.strip()
         if not s: return None
         lo = s.lower()
-        if lo in ("quit","exit"):
-            return Command(action="quit")
-        if lo in ("help","h","?"):
-            # 서버는 help를 출력하지 않음(클라이언트가 출력)
-            return Command(action="help")
-
+        if lo in ("quit","exit"):  return Command(action="quit")
+        if lo in ("help","h","?"): return Command(action="help")
         try: tokens = shlex.split(s)
         except ValueError: tokens = s.split()
-
         cmd = Command()
         for tok in tokens:
             tl = tok.lower()
@@ -235,55 +211,45 @@ class CommandParser:
             if tl in ("end",):   cmd.action="end";   continue
             if tl in ("stop",):  cmd.action="stop";  continue
             if tl in ("zero","origin"): cmd.action="zero"; continue
-            if "=" not in tok:
-                continue
+            if "=" not in tok: continue
             k,v = tok.split("=",1); k=k.strip().lower(); v=v.strip()
             if k=="id":
                 if v.lower()=="all": cmd.ids = sorted(id_pool)
                 else:
                     try: cmd.ids = [int(v)]
                     except: pass
-            elif k in ("k","kp"):
-                cmd.gains["K"] = float(v)
-            elif k in ("b","kd"):
-                cmd.gains["B"] = float(v)
-            elif k in ("pos","position"):
-                cmd.setp["pos"] = float(v)
-            elif k in ("vel","velocity"):
-                cmd.setp["vel"] = float(v)
-            elif k in ("tor","torque"):
-                cmd.setp["torque"] = float(v)
-            elif k=="full":
-                cmd.full = bool(int(v))
-
+            elif k in ("k","kp"):   cmd.gains["K"] = float(v)
+            elif k in ("b","kd"):   cmd.gains["B"] = float(v)
+            elif k in ("pos","position"): cmd.setp["pos"] = float(v)
+            elif k in ("vel","velocity"): cmd.setp["vel"] = float(v)
+            elif k in ("tor","torque"):   cmd.setp["torque"] = float(v)
+            elif k=="full": cmd.full = bool(int(v))
         if not cmd.ids:
             print("[server] 반드시 id=.. 또는 id=all 을 지정하세요. (help로 도움말)")
             return None
-
-        # 액션과 파라미터 혼합 여부 기록(서버에서 경고 출력)
         if cmd.action in ("start","end","stop","zero") and (cmd.gains or cmd.setp or cmd.full is not None):
             cmd.mixed = True
-
         return cmd
 
-# ---------- 기록기 ----------
+# ---------- 이벤트/기록 ----------
 class CsvRecorder:
+    """CSV: time,bus,id,type,pos,vel,acc,torque,temp,err,cmd_text,cmd_kind,cmd_recv_epoch,cmd_latency_ms"""
+    HEADER = ["time","bus","id","type","pos","vel","acc","torque","temp","err",
+              "cmd_text","cmd_kind","cmd_recv_epoch","cmd_latency_ms"]
     def __init__(self, path: Path):
         self.path = path
         self._fh = None
         self._w = None
-
     def open(self):
         exists = self.path.exists() and self.path.stat().st_size > 0
         self._fh = open(self.path, "a", newline="")
         self._w = csv.writer(self._fh)
         if not exists:
-            # iq 제거됨
-            self._w.writerow(["time","bus","id","type","pos","vel","acc","torque","temp","err"])
-
+            self._w.writerow(self.HEADER)
+            # 세션 기준시각 주석(절대시각 복원용)
+            self._fh.write(f"# session_epoch={time.time():.6f}\n")
     def write(self, row: List):
         if self._w: self._w.writerow(row)
-
     def close(self):
         try:
             if self._fh: self._fh.flush(); self._fh.close()
@@ -293,7 +259,7 @@ class CsvRecorder:
 class CmdLogger:
     def __init__(self, path: Path):
         self._fh = open(path, "a", buffering=1)
-        self._fh.write(f"# cmd log start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self._fh.write(f"# cmd log start {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
     def log(self, s: str):
         t = time.time()
         try:
@@ -302,10 +268,17 @@ class CmdLogger:
             pass
     def close(self):
         try:
-            self._fh.write(f"# cmd log end {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self._fh.write(f"# cmd log end {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
             self._fh.close()
         except Exception:
             pass
+
+@dataclass
+class PendingCmd:
+    text: str
+    kind: str
+    recv_epoch: float
+    recv_rel: float
 
 # ---------- FIFO ----------
 def ensure_fifo(path: str):
@@ -319,17 +292,18 @@ def ensure_fifo(path: str):
     else:
         os.mkfifo(path)
 
+@dataclass
+class RawCmd:
+    text: str
+    recv_epoch: float
+    recv_rel: float
+
 class FifoCommandServer:
-    """
-    Non-blocking reader using os.open(O_RDONLY|O_NONBLOCK) + select.select().
-    EOF(=writers all closed) 발생 시 FD 재오픈하여 지속 수신.
-    """
+    """Non-blocking reader; enqueues RawCmd(text, recv_epoch, recv_rel)."""
     def __init__(self, path: str):
         self.path = path
         ensure_fifo(self.path)
-
-    def reader_thread(self, q: "queue.Queue[str]", stop_evt: threading.Event):
-        fd = None
+    def reader_thread(self, q: "queue.Queue[RawCmd]", stop_evt: threading.Event, t0_perf: float):
         fobj = None
         try:
             while not stop_evt.is_set():
@@ -341,17 +315,16 @@ class FifoCommandServer:
                     if fobj in rlist:
                         line = fobj.readline()
                         if line == "":
-                            # EOF: no writers; reopen
                             try: fobj.close()
                             except Exception: pass
                             fobj = None
                             time.sleep(0.05)
                             continue
-                        q.put(line)
+                        q.put(RawCmd(text=line.rstrip("\n"),
+                                     recv_epoch=time.time(),
+                                     recv_rel=time.perf_counter() - t0_perf))
                 except FileNotFoundError:
-                    # fifo removed & recreated? ensure and retry
-                    ensure_fifo(self.path)
-                    time.sleep(0.1)
+                    ensure_fifo(self.path); time.sleep(0.1)
                 except Exception:
                     time.sleep(0.05)
         finally:
@@ -363,7 +336,6 @@ class FifoCommandServer:
 class FifoCommandClient:
     def __init__(self, path: str):
         self.path = path
-
     def run(self, bus: str):
         print(f"[client:{bus}] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help")
         waited=0.0
@@ -383,8 +355,7 @@ class FifoCommandClient:
                     except (EOFError,KeyboardInterrupt): line="quit"
                     if not line: continue
                     if line.lower() in ("help","h","?"):
-                        print(help_text(bus_hint=bus))
-                        continue
+                        print(help_text(bus_hint=bus)); continue
                     fw.write(line+"\n"); fw.flush()
                     if line.lower() in ("quit","exit"):
                         print("bye"); break
@@ -392,7 +363,7 @@ class FifoCommandClient:
             print(f"[client:{bus}] error: {e}")
             input("Press Enter to close...")
 
-# ---------- 매핑 파서(문자열 → 버스: {id: type}) ----------
+# ---------- 매핑 파서 ----------
 def parse_idmap_onebus(idmap: str, default_type: str) -> Dict[int, str]:
     out: Dict[int,str] = {}
     if not idmap: return out
@@ -426,6 +397,7 @@ class _MotorRuntime:
     csv: Optional[CsvRecorder] = None
     cmdlog: Optional[CmdLogger] = None
     mtype: str = ""
+    pending: Optional[PendingCmd] = None
 
 class MotorBusServer:
     def __init__(self, bus: str, id2type: Dict[int, str], hz: int):
@@ -436,48 +408,56 @@ class MotorBusServer:
         self.hz = hz
         self.scheduler = RealtimeScheduler(hz=self.hz)
         self.stop_evt = threading.Event()
-        self.q: "queue.Queue[str]" = queue.Queue()
+        self.q: "queue.Queue[RawCmd]" = queue.Queue()
         self.fifo = FifoCommandServer(fifo_path_for_bus(self.bus))
         self.parser = CommandParser()
         self.motors: Dict[int, _MotorRuntime] = {}
         self._status_last = 0.0
+        self._t0 = None  # perf base
 
     def start(self):
         force_socketcan_channel(self.bus)
-        # 디바이스 매니저/컨트롤러 준비
+        failed = []
         for mid, mtype in self.id2type.items():
-            m = TMotorManager_mit_can(motor_type=mtype, motor_ID=mid, max_mosfett_temp=90)
-            m.__enter__()
-            ctrl = MotorController(m, mtype, K_init=5.0, B_init=0.1, full_state=True)
-            # 안전초기화: vel/tor=0 (pos는 명령하지 않음)
-            ctrl.command(vel=0.0, torque=0.0)
-            rt = _MotorRuntime(mgr=m, ctrl=ctrl, rec_on=False, csv=None,
-                               cmdlog=CmdLogger(cmdlog_path_for_motor(self.bus, mid)),
-                               mtype=mtype)
-            self.motors[mid] = rt
-
-        # FIFO reader thread
-        th = threading.Thread(target=self.fifo.reader_thread, args=(self.q, self.stop_evt), daemon=True)
-        th.start()
-        print(f"[server:{self.bus}] running. ids={list(self.id2type.keys())}  (`help`는 클라이언트에서, `quit` 종료)")
-
-    def shutdown(self):
-        # 안전 정지
-        for mid, rt in self.motors.items():
             try:
-                rt.ctrl.apply_gains(K=0.0, B=0.0)
-                rt.ctrl.command(vel=0.0, torque=0.0)
-                rt.ctrl.zero()
-                if rt.csv: rt.csv.close()
-                if rt.cmdlog: rt.cmdlog.close()
-            except Exception:
-                pass
-        for mid, rt in self.motors.items():
-            try: rt.mgr.__exit__(None,None,None)
-            except Exception: pass
-        print(f"\n[server:{self.bus}] exit.")
+                m = TMotorManager_mit_can(motor_type=mtype, motor_ID=mid, max_mosfett_temp=90)
+                m.__enter__()
+                ctrl = MotorController(m, mtype, K_init=5.0, B_init=0.1, full_state=True)
+                ctrl.command(vel=0.0, torque=0.0)
+                rt = _MotorRuntime(mgr=m, ctrl=ctrl, rec_on=False, csv=None,
+                                   cmdlog=CmdLogger(cmdlog_path_for_motor(self.bus, mid)),
+                                   mtype=mtype)
+                self.motors[mid] = rt
+            except Exception as e:
+                msg = str(e); failed.append((mid, mtype, msg))
+                print(f"[server:{self.bus}] init failed for id{mid}({mtype}): {msg}")
+                if "Device not connected" in msg:
+                    print("  → 전원/공통 GND/CAN-H/L/종단저항/ID/bitrate(1Mbps) 확인 및 라즈베리파이 저전압 경고 해결 필요")
+        if not self.motors:
+            reason = failed[0][2] if failed else "unknown"
+            raise RuntimeError(f"No motors started on {self.bus}. First error: {reason}")
+        if failed:
+            human = ", ".join([f"id{mid}({t})" for mid, t, _ in failed])
+            print(f"[server:{self.bus}] WARNING: some motors failed to init: {human}")
+        print(f"[server:{self.bus}] ready. ids={list(self.motors.keys())}  (`help`는 클라이언트에서, `quit` 종료)")
 
-    def _handle_action(self, cmd: Command):
+    # 이벤트 스케줄: 다음 샘플 행에 기록
+    def _schedule_event(self, mid: int, kind: str, text: str, recv_epoch: float, recv_rel: float):
+        rt = self.motors.get(mid)
+        if not rt or not rt.rec_on or not rt.csv:
+            return  # 녹화 중이 아닐 때는 CSV에 남기지 않음
+        if rt.pending is None:
+            rt.pending = PendingCmd(text=text, kind=kind, recv_epoch=recv_epoch, recv_rel=recv_rel)
+        else:
+            # 텍스트 합치고, kind가 다르면 'cmd'로 포괄
+            rt.pending.text = f"{rt.pending.text} ; {text}"
+            if rt.pending.kind != kind:
+                rt.pending.kind = "cmd"
+            # 수신시각은 가장 이른 것으로 유지
+            rt.pending.recv_epoch = min(rt.pending.recv_epoch, recv_epoch)
+            rt.pending.recv_rel   = min(rt.pending.recv_rel, recv_rel)
+
+    def _handle_action(self, cmd: Command, raw: RawCmd):
         if cmd.mixed:
             print("[server] 경고: action과 파라미터를 한 줄에 섞을 수 없습니다. (action만 수행)")
         ids = cmd.ids
@@ -489,39 +469,55 @@ class MotorBusServer:
                     rec = CsvRecorder(csv_path_for_motor(self.bus, mid)); rec.open()
                     rt.csv = rec; rt.rec_on = True
                 if rt.cmdlog: rt.cmdlog.log("## START")
+                # 다음 샘플에 'start' 표시
+                self._schedule_event(mid, "start", "start", raw.recv_epoch, raw.recv_rel)
             print(f"\n[server:{self.bus}] start recording ids={ids}")
             return
+
         if cmd.action == "end":
+            # 종료 직전에 'end' 이벤트를 즉시 1줄 기록
+            now_rel = time.perf_counter() - self._t0
             for mid in ids:
-                rt = self.motors.get(mid); 
-                if not rt: continue
+                rt = self.motors.get(mid)
+                if not rt or not rt.csv: continue
+                st = rt.ctrl.state()
+                latency_ms = (now_rel - raw.recv_rel) * 1000.0
+                rt.csv.write([
+                    f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                    st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                    "end", "end", f"{raw.recv_epoch:.6f}", f"{latency_ms:.3f}"
+                ])
                 rt.rec_on = False
                 if rt.csv: rt.csv.close(); rt.csv=None
                 if rt.cmdlog: rt.cmdlog.log("## END")
             print(f"\n[server:{self.bus}] end recording ids={ids}")
             return
+
         if cmd.action == "stop":
             for mid in ids:
                 rt = self.motors.get(mid); 
                 if not rt: continue
                 try:
                     rt.ctrl.apply_gains(K=0.0, B=0.0)
-                    rt.ctrl.command(vel=0.0, torque=0.0)   # pos 명령 없음
+                    rt.ctrl.command(vel=0.0, torque=0.0)
                     rt.ctrl.zero()
                     if rt.cmdlog: rt.cmdlog.log("## STOP")
+                    self._schedule_event(mid, "stop", "stop", raw.recv_epoch, raw.recv_rel)
                 except Exception as e:
                     print(f"\n[server:{self.bus}] stop 적용 실패 id={mid}: {e}")
             print(f"\n[server:{self.bus}] stop applied ids={ids}")
             return
+
         if cmd.action == "zero":
             for mid in ids:
                 rt = self.motors.get(mid); 
                 if not rt: continue
                 rt.ctrl.zero()
                 if rt.cmdlog: rt.cmdlog.log("## ZERO")
+                self._schedule_event(mid, "zero", "zero", raw.recv_epoch, raw.recv_rel)
             return
 
-    def _handle_non_action(self, cmd: Command, raw_line: str):
+    def _handle_non_action(self, cmd: Command, raw: RawCmd):
         # gains/full
         if cmd.gains or (cmd.full is not None):
             for mid in cmd.ids:
@@ -534,10 +530,15 @@ class MotorBusServer:
                 rt = self.motors.get(mid); 
                 if not rt: continue
                 rt.ctrl.command(**cmd.setp)
+
+        # 명령 이벤트 예약 (원문 전체를 기록)
+        for mid in cmd.ids:
+            self._schedule_event(mid, "cmd", raw.text, raw.recv_epoch, raw.recv_rel)
+
         # cmd log
         for mid in cmd.ids:
             rt = self.motors.get(mid)
-            if rt and rt.cmdlog: rt.cmdlog.log(raw_line)
+            if rt and rt.cmdlog: rt.cmdlog.log(raw.text)
 
     def _print_status(self, t_now: float):
         if (t_now - self._status_last) < 0.1:
@@ -556,41 +557,72 @@ class MotorBusServer:
 
     def run(self):
         self.start()
-        t0 = time.perf_counter()
+        self._t0 = time.perf_counter()
+        # FIFO reader thread (수신시각에 self._t0 사용)
+        th = threading.Thread(target=self.fifo.reader_thread, args=(self.q, self.stop_evt, self._t0), daemon=True)
+        th.start()
         try:
             while not self.stop_evt.is_set():
                 _ = self.scheduler.tick()
                 # 제어 업데이트 + CSV 기록
+                now_rel = time.perf_counter() - self._t0
                 for mid, rt in self.motors.items():
                     rt.ctrl.tick()
                     if rt.rec_on and rt.csv:
                         st = rt.ctrl.state()
-                        rt.csv.write([
-                            f"{time.perf_counter()-t0:.6f}", self.bus, mid, rt.mtype,
-                            st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"]
-                        ])
-                # 커맨드 처리(가능한 만큼 비우기)
+                        # 이벤트가 있으면 채우고 비움
+                        if rt.pending:
+                            latency_ms = (now_rel - rt.pending.recv_rel) * 1000.0
+                            row = [
+                                f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                                st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                                rt.pending.text, rt.pending.kind, f"{rt.pending.recv_epoch:.6f}", f"{latency_ms:.3f}"
+                            ]
+                            rt.pending = None
+                        else:
+                            row = [
+                                f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                                st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                                "", "", "", ""
+                            ]
+                        rt.csv.write(row)
+
+                # 커맨드 처리
                 try:
                     while True:
-                        line = self.q.get_nowait()
-                        cmd = self.parser.parse(line, id_pool=list(self.motors.keys()))
+                        raw = self.q.get_nowait()
+                        cmd = self.parser.parse(raw.text, id_pool=list(self.motors.keys()))
                         if cmd is None: 
                             continue
                         if cmd.action == "quit":
                             self.stop_evt.set(); break
                         if cmd.action == "help":
-                            # 서버에서는 help 출력 안 함(클라에서 표시)
                             continue
                         if cmd.action in ("start","end","stop","zero"):
-                            self._handle_action(cmd)
+                            self._handle_action(cmd, raw)
                         else:
-                            self._handle_non_action(cmd, raw_line=line)
+                            self._handle_non_action(cmd, raw)
                 except queue.Empty:
                     pass
-                # 상태 출력
+
                 self._print_status(time.perf_counter())
         finally:
             self.shutdown()
+
+    def shutdown(self):
+        for mid, rt in self.motors.items():
+            try:
+                rt.ctrl.apply_gains(K=0.0, B=0.0)
+                rt.ctrl.command(vel=0.0, torque=0.0)
+                rt.ctrl.zero()
+                if rt.csv: rt.csv.close()
+                if rt.cmdlog: rt.cmdlog.close()
+            except Exception:
+                pass
+        for mid, rt in self.motors.items():
+            try: rt.mgr.__exit__(None,None,None)
+            except Exception: pass
+        print(f"\n[server:{self.bus}] exit.")
 
 # ---------- spawn/setup/cli ----------
 def find_terminal():
@@ -636,24 +668,7 @@ def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int):
 
 def run_setup(default_hz: int):
     print("# Setup Wizard")
-    print("이 마법사는 아래 순서로 도와줍니다.")
-    print("  1) 사용할 CAN 버스 이름(can0/can1/...)을 정합니다.")
-    print("  2) 각 버스에 연결된 모터의 ID와 타입을 입력합니다. (예: 1 AK70-10, 2 AK80-64)")
-    print("  3) 제어 주파수(Hz)를 정합니다. (기본 200)")
-    print("  4) 설정을 확인한 뒤, 버스별 서버/클라이언트를 자동으로 띄웁니다(spawn).")
-    print("")
-    print("입력 형식 예시:")
-    print("  can0: 1 AK70-10, 2 AK80-64")
-    print("  can1: 3 AK80-64")
-    print("입력을 마치려면 빈 줄을 입력하세요.")
-    print("")
-    print("실행 후 사용:")
-    print("  - 각 버스마다 두 창이 뜹니다(서버/클라이언트).")
-    print("  - 클라이언트 창에서 'help'를 입력하면 명령 설명이 나옵니다.")
-    print("  - 기록은 'id=<번호> start' 로 시작하고 'id=<번호> end' 로 끝냅니다.")
-    print("  - 기록 파일과 명령 로그는 logs/ 폴더에 모터 ID별로 저장됩니다.")
-    print("")
-
+    print("버스/ID/타입 입력 → 주파수 설정 → spawn 자동 실행")
     mapping: Dict[str, Dict[int,str]] = {}
     while True:
         line = input("버스 입력 (예: can0: 1 AK70-10, 2 AK80-64) > ").strip()
@@ -679,8 +694,7 @@ def run_setup(default_hz: int):
         mapping[bus] = pairs
 
     if not mapping:
-        print("설정이 비어 있습니다. 종료.")
-        return
+        print("설정이 비어 있습니다. 종료."); return
 
     print("\n## 설정 요약")
     for bus, mp in mapping.items():
@@ -690,9 +704,7 @@ def run_setup(default_hz: int):
     except Exception:
         hz = default_hz
 
-    print("\n[안내] 이제 버스별 서버/클라이언트 창을 자동으로 띄웁니다.")
-    print("  - 서버 창: 실시간 상태 출력, start~end 구간만 CSV 기록")
-    print("  - 클라 창: id=.. 으로 대상 지정 후 명령 입력 (help로 도움말)")
+    print("\n[안내] 버스별 서버/클라이언트 창을 자동으로 띄웁니다.")
     yn = input("이 설정으로 spawn 할까요? [Y/n] ").strip().lower()
     if yn in ("", "y", "yes"):
         run_spawn(mapping, hz)
@@ -702,12 +714,11 @@ def run_setup(default_hz: int):
 # ---------- main ----------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=("server","client","spawn","setup"), default="setup",
-                   help="setup: 설정 마법사 / spawn: 버스별 서버/클라 자동 스폰 / server|client: 단일 버스")
+    p.add_argument("--mode", choices=("server","client","spawn","setup"), default="setup")
     p.add_argument("--hz", type=int, default=200)
-    p.add_argument("--bus", default="can0", help="server/client 단일 버스 지정")
-    p.add_argument("--idmap", default="", help='server 단일 버스: "1:AK70-10,2:AK80-64" (타입 지정)')
-    p.add_argument("--map", default="", help='spawn 다중 버스: "can0:1:AK70-10,2:AK80-64;can1:3:AK80-64"')
+    p.add_argument("--bus", default="can0")
+    p.add_argument("--idmap", default="", help='server: "1:AK70-10,2:AK80-64"')
+    p.add_argument("--map", default="",  help='spawn: "can0:1:AK70-10,2:AK80-64;can1:3:AK80-64"')
     args = p.parse_args()
 
     if args.mode == "setup":
