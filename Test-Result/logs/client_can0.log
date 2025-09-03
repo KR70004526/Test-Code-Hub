@@ -35,3 +35,7 @@ CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> === Motor Cons
 - CSV 기록은 start~end 구간만 저장되며, 모터 ID별 파일로 분리됩니다.
 
 CMD[can0]> bye
+[client:can0] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help
+[client:can0] opening FIFO... (may wait until server opens reader)
+  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.
+CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> CMD[can0]> bye
