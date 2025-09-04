@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_motor_console_setup.py (session-folder + events-in-CSV)
-- 세션 폴더 방식: logs/<SESSION_TAG>/ 아래에 모든 산출물 CSV/로그 저장
-- CSV에 명령 이벤트 컬럼 포함: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
-- 각 ID CSV에는 해당 ID에 적용된 명령만 표시
-- FIFO non-blocking, lazy SoftRealtimeLoop, 상태읽기 락, help 중복 제거 반영
+multi_motor_console_setup.py (session-folder fixed + events-in-CSV)
+- 세션 폴더 생성 시점을 실행(main) 시점으로 지연 → 빈 세션 폴더 다중 생성 버그 해결
+- logs/<SESSION_TAG>/ 아래에 모든 산출물(CSV/명령로그/서버·클라 로그) 저장
+- CSV에 이벤트 컬럼 포함: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
+- FIFO non-blocking, lazy SoftRealtimeLoop
 """
 
 import os, sys, csv, shlex, time, stat, argparse, threading, queue, select
@@ -19,24 +19,22 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# 세션 태그/폴더 전역 (spawn 부모 또는 --session-tag로 통일 가능)
-SESSION_TAG = None
-SESSION_DIR: Path = LOG_DIR  # 초기값 (set_session_tag 호출로 갱신)
+# 세션 태그/폴더: import 시에는 만들지 않는다 (main에서 결정)
+SESSION_TAG: Optional[str] = None
+SESSION_DIR: Path = LOG_DIR  # 아직은 logs 루트만 가리킴
 
 def set_session_tag(tag: Optional[str] = None):
-    """세션 태그/폴더 설정 (없으면 현재 시각 기반으로 생성)"""
+    """세션 태그/폴더 설정 (여기서 처음으로 세션 폴더를 실제 생성)"""
     global SESSION_TAG, SESSION_DIR
     if tag is None:
         tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")  # 마이크로초 포함
     SESSION_TAG = tag
     SESSION_DIR = LOG_DIR / SESSION_TAG
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
-
-# 최초 기본 세션 설정
-set_session_tag()
+    print(f"[session] tag={SESSION_TAG} dir={SESSION_DIR}")
 
 def fifo_path_for_bus(bus: str) -> str:
-    # FIFO는 고정 경로(세션과 무관) — 클라이언트가 항상 같은 경로로 접속 가능
+    # FIFO는 고정 경로(세션과 무관): 클라이언트가 항상 같은 경로로 접속 가능
     return str(BASE_DIR / f"cmd_{bus}.fifo")
 
 def csv_path_for_motor(bus: str, mid: int) -> Path:
@@ -262,8 +260,8 @@ class CsvRecorder:
         self._fh = None
         self._w = None
     def open(self):
-        exists = self.path.exists() and self.path.stat().st_size > 0
-        self._fh = open(self.path, "w", newline="")  # 새 파일로 작성 (세션 폴더이므로 중복 없음)
+        # 세션 폴더 사용 → 항상 새 파일 작성
+        self._fh = open(self.path, "w", newline="")
         self._w = csv.writer(self._fh)
         # 세션 기준시각 주석(절대시각 복원용) + 헤더
         self._fh.write(f"# session_epoch={time.time():.6f}\n")
@@ -278,8 +276,7 @@ class CsvRecorder:
 
 class CmdLogger:
     def __init__(self, path: Path):
-        # 세션 폴더이므로 append 필요 없음. 그래도 안전하게 'w'로 새로 연다.
-        self._fh = open(path, "w", buffering=1)
+        self._fh = open(path, "w", buffering=1)  # 새 파일
         self._fh.write(f"# cmd log start {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
     def log(self, s: str):
         t = time.time()
@@ -661,9 +658,10 @@ def run_client(bus: str):
     fifo = fifo_path_for_bus(bus)
     FifoCommandClient(fifo).run(bus)
 
-def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int):
-    # 부모 프로세스에서 세션 태그를 생성하고 전파
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
+def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int, tag: Optional[str] = None):
+    # 부모 프로세스에서 단 한 번 세션 태그 생성/적용
+    if tag is None:
+        tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
     set_session_tag(tag)
 
     term = find_terminal()
@@ -707,7 +705,7 @@ def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int):
             os.system(f'gnome-terminal --title="Motor Input {bus}"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
 
 def run_setup(default_hz: int):
-    print("# Setup Wizard (세션 폴더 방식)")
+    print("# Setup Wizard (세션 폴더 방식, spawn에서 생성)")
     print("버스/ID/타입 입력 → 주파수 설정 → spawn 자동 실행")
     mapping: Dict[str, Dict[int,str]] = {}
     while True:
@@ -759,12 +757,20 @@ def main():
     p.add_argument("--bus", default="can0")
     p.add_argument("--idmap", default="", help='server: "1:AK70-10,2:AK80-64"')
     p.add_argument("--map", default="",  help='spawn: "can0:1:AK70-10,2:AK80-64;can1:3:AK80-64"')
-    p.add_argument("--session-tag", default=None, help="세션 태그를 고정(부모 spawn에서 전달)")
+    p.add_argument("--session-tag", default=None, help="세션 태그 고정(부모 spawn에서 전달)")
     args = p.parse_args()
 
-    # 세션 태그 반영 (spawn 자식/단일 실행에서도 동일 폴더 사용 가능)
-    if args.session_tag:
-        set_session_tag(args.session_tag)
+    # 세션 폴더 생성 타이밍을 모드별로 제어
+    if args.mode == "server":
+        set_session_tag(args.session_tag)  # None이면 새 태그 생성
+    elif args.mode == "client":
+        set_session_tag(args.session_tag)  # None이면 새 태그 생성(클라 로그도 세션 폴더에)
+    elif args.mode == "spawn":
+        # 부모 run_spawn에서 생성하므로 여기서는 만들지 않음
+        pass
+    elif args.mode == "setup":
+        # spawn에서 만들도록 지연
+        pass
 
     if args.mode == "setup":
         run_setup(args.hz); return
@@ -776,7 +782,7 @@ def main():
             if not id2type:
                 print('spawn 모드: --map 또는 (--bus 와 --idmap "1:AK70-10,2:AK80-64") 필요'); sys.exit(2)
             mapping = {args.bus: id2type}
-        run_spawn(mapping, args.hz); return
+        run_spawn(mapping, args.hz, tag=args.session_tag); return
 
     if args.mode == "client":
         run_client(args.bus); return
