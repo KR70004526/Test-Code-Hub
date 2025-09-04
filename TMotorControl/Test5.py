@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_motor_console_setup.py (session-folder + events-in-CSV + Scenario Loader/Runner)
-- 세션 폴더 방식 유지: logs/<SESSION_TAG>/ 아래에 CSV/명령로그/서버·클라 로그 저장
-- CSV 이벤트 컬럼: cmd_text, cmd_kind, cmd_recv_epoch, cmd_latency_ms
-- FIFO non-blocking, lazy SoftRealtimeLoop
-- 시나리오 실행 지원:
-  * YAML/JSON 파일로 steps를 정의 (apply_gains/move/vel/torque/start_record/end_record/hold/safe_zero/stop 등)
-  * YAML에서 CSV trajectory를 sources로 참조 → play_sources 스텝에서 재생
-  * 서버 내부 큐(RawCmd)를 통해 텍스트 명령 주입 → 기존 파서/로깅 그대로 사용
+Test5.py  (Ready->Go handshake + Scenario runner)
+- 서버가 루프 안정화 후 ready_event를 set → 러너는 이를 기다린 뒤 자동 오프셋을 두고 실행
+- cmd_* 이벤트 컬럼을 CSV에 기록
+- 세션 폴더 logs/<YYYYmmdd-HHMMSS_xxxxxx>/ 에 모든 산출물 저장
 """
 
-import os, sys, csv as csvmod, shlex, time, stat, argparse, threading, queue, select, json
+import os, sys, csv, shlex, time, stat, argparse, threading, queue, select, math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any, Union
+from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime
 
-# ---------- 경로/세션 ----------
+# ---------------- Paths & Session ----------------
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_TAG: Optional[str] = None
-SESSION_DIR: Path = LOG_DIR  # main()에서 set_session_tag 호출 시 실제 세션 폴더로 교체
+SESSION_DIR: Path = LOG_DIR
 
 def set_session_tag(tag: Optional[str] = None):
-    """세션 태그/폴더 설정 (main에서 처음 생성)"""
+    """세션 태그/폴더 생성 (최초 1회)"""
     global SESSION_TAG, SESSION_DIR
+    if SESSION_TAG is not None:
+        return
     if tag is None:
         tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
     SESSION_TAG = tag
@@ -36,7 +34,7 @@ def set_session_tag(tag: Optional[str] = None):
     print(f"[session] tag={SESSION_TAG} dir={SESSION_DIR}")
 
 def fifo_path_for_bus(bus: str) -> str:
-    return str(BASE_DIR / f"cmd_{bus}.fifo")  # 고정 경로(FIFO는 세션과 무관)
+    return str(BASE_DIR / f"cmd_{bus}.fifo")
 
 def csv_path_for_motor(bus: str, mid: int) -> Path:
     return SESSION_DIR / f"session_{bus}_id{mid}.csv"
@@ -44,24 +42,38 @@ def csv_path_for_motor(bus: str, mid: int) -> Path:
 def cmdlog_path_for_motor(bus: str, mid: int) -> Path:
     return SESSION_DIR / f"cmd_{bus}_id{mid}.log"
 
-# ---------- sys.path 보강 ----------
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
-if str(BASE_DIR.parent) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR.parent))
-
-# ---------- SoftRealtimeLoop ----------
+# ---------------- Optional deps ----------------
 try:
     from NeuroLocoMiddleware.SoftRealtimeLoop import SoftRealtimeLoop
     HAVE_SRL = True
 except Exception:
     HAVE_SRL = False
 
+TMOTOR_OK = True
+TMOTOR_IMPORT_ERR = ""
+try:
+    from TMotorCANControl import TMotorManager_mit_can
+    from TMotorCANControl.mit_can import MIT_Params
+except Exception as e:
+    TMOTOR_OK = False
+    TMOTOR_IMPORT_ERR = str(e)
+
+# ---------------- Utilities ----------------
 def _fmtf(x, fmt="{:+.3f}"):
     try: return fmt.format(float(x))
     except Exception: return str(x)
 
-# ---------- python-can 채널 고정 ----------
+def ensure_fifo(path: str):
+    p = Path(path)
+    if p.exists():
+        st = p.stat()
+        if not stat.S_ISFIFO(st.st_mode):
+            try: p.unlink()
+            except Exception: pass
+            os.mkfifo(path)
+    else:
+        os.mkfifo(path)
+
 def force_socketcan_channel(channel: str):
     try:
         import can
@@ -77,67 +89,29 @@ def force_socketcan_channel(channel: str):
         return orig_bus(*args, **kwargs)
     can.interface.Bus = Bus_patched
 
-# ---------- TMotor ----------
-TMOTOR_OK = True
-TMOTOR_IMPORT_ERR = ""
-try:
-    from TMotorCANControl import TMotorManager_mit_can
-    from TMotorCANControl.mit_can import MIT_Params
-except Exception as e:
-    TMOTOR_OK = False
-    TMOTOR_IMPORT_ERR = str(e)
-
-# ---------- HELP ----------
-def help_text(bus_hint: Optional[str]=None) -> str:
-    bus_str = f"[bus={bus_hint}] " if bus_hint else ""
-    return (
-f"""\
-=== Motor Console Help {bus_str}===
-
-명령 형식:
-  id=<번호|all>  K=<float>  B=<float>  pos=<rad>  vel=<rad/s>  tor=<Nm>  full=<0|1>
-제어/유틸:
-  start | end | stop | zero | help | quit
-
-CSV 추가 컬럼:
-  cmd_text, cmd_kind(cmd|start|end|stop|zero), cmd_recv_epoch(sec), cmd_latency_ms
-
-세션 폴더:
-  {SESSION_DIR}
-
-시나리오 실행(서버 모드에서 CLI):
-  --scenario path.yaml   # 또는 .json (PyYAML 없으면 JSON만)
-  YAML 예시: steps에 apply_gains/move/vel/torque/start_record/end_record/hold/safe_zero/stop 등
-  CSV 재생: YAML 'sources' 정의 후 steps에 'play_sources' 추가 (아래 주석 참고)
-"""
-    )
-
-# ---------- 스케줄러 ----------
+# ---------------- Realtime Scheduler ----------------
 class RealtimeScheduler:
     def __init__(self, hz: int):
         self.dt = 1.0 / float(hz)
         self._use_srl = HAVE_SRL
-        self._srl = None
         self._iter = None
         self._t0 = None
         self._n = 0
 
-    def tick(self):
+    def tick(self) -> float:
+        # SoftRealtimeLoop가 가능하면 사용
         if self._use_srl and self._iter is None:
             try:
-                self._srl = SoftRealtimeLoop(dt=self.dt, report=True, fade=0.0)
-                self._iter = iter(self._srl)
+                self._iter = iter(SoftRealtimeLoop(dt=self.dt, report=False, fade=0.0))
             except Exception:
                 self._use_srl = False
 
         if self._use_srl:
             return next(self._iter)
 
-        # fallback
         if self._t0 is None:
             self._t0 = time.perf_counter()
             self._n = 0
-
         self._n += 1
         tgt = self._t0 + self._n * self.dt
         now = time.perf_counter()
@@ -146,7 +120,7 @@ class RealtimeScheduler:
             time.sleep(delay)
         return tgt - self._t0
 
-# ---------- 디바이스 컨트롤러 ----------
+# ---------------- Motor Controller ----------------
 class MotorController:
     def __init__(self, manager: "TMotorManager_mit_can", motor_type: str,
                  K_init: float=5.0, B_init: float=0.1, full_state: bool=True):
@@ -163,11 +137,11 @@ class MotorController:
         p = MIT_Params.get(self.type) if TMOTOR_OK else None
         if p is None:
             if not self._warned_missing_type:
-                print(f"[warn] MIT_Params missing for type '{self.type}'. Gains are not clamped.")
+                print(f"[warn] MIT_Params missing for '{self.type}'. Gains not clamped.")
                 self._warned_missing_type = True
             return K, B
-        Kp_min, Kp_max = p.get("Kp_min", None), p.get("Kp_max", None)
-        Kd_min, Kd_max = p.get("Kd_min", None), p.get("Kd_max", None)
+        Kp_min, Kp_max = p.get("Kp_min"), p.get("Kp_max")
+        Kd_min, Kd_max = p.get("Kd_min"), p.get("Kd_max")
         if Kp_min is not None: K = max(K, Kp_min)
         if Kp_max is not None: K = min(K, Kp_max)
         if Kd_min is not None: B = max(B, Kd_min)
@@ -188,9 +162,12 @@ class MotorController:
 
     def command(self, *, pos=None, vel=None, torque=None):
         with self._lock:
-            if pos is not None:    self.m.set_output_angle_radians(float(pos))
-            if vel is not None:    self.m.set_output_velocity_radians_per_second(float(vel))
-            if torque is not None: self.m.set_output_torque_newton_meters(float(torque))
+            if pos is not None:
+                self.m.set_output_angle_radians(float(pos))
+            if vel is not None:
+                self.m.set_output_velocity_radians_per_second(float(vel))
+            if torque is not None:
+                self.m.set_output_torque_newton_meters(float(torque))
 
     def zero(self):
         with self._lock:
@@ -211,7 +188,7 @@ class MotorController:
                 "err": self.m.error,
             }
 
-# ---------- 파서 ----------
+# ---------------- Command Parser ----------------
 @dataclass
 class Command:
     ids: List[int] = field(default_factory=list)
@@ -233,9 +210,9 @@ class CommandParser:
         cmd = Command()
         for tok in tokens:
             tl = tok.lower()
-            if tl in ("start",): cmd.action="start"; continue
-            if tl in ("end",):   cmd.action="end";   continue
-            if tl in ("stop",):  cmd.action="stop";  continue
+            if tl=="start": cmd.action="start"; continue
+            if tl=="end":   cmd.action="end";   continue
+            if tl=="stop":  cmd.action="stop";  continue
             if tl in ("zero","origin"): cmd.action="zero"; continue
             if "=" not in tok: continue
             k,v = tok.split("=",1); k=k.strip().lower(); v=v.strip()
@@ -257,9 +234,8 @@ class CommandParser:
             cmd.mixed = True
         return cmd
 
-# ---------- 이벤트/기록 ----------
+# ---------------- Logging ----------------
 class CsvRecorder:
-    """CSV: time,bus,id,type,pos,vel,acc,torque,temp,err,cmd_text,cmd_kind,cmd_recv_epoch,cmd_latency_ms"""
     HEADER = ["time","bus","id","type","pos","vel","acc","torque","temp","err",
               "cmd_text","cmd_kind","cmd_recv_epoch","cmd_latency_ms"]
     def __init__(self, path: Path):
@@ -268,10 +244,10 @@ class CsvRecorder:
         self._w = None
     def open(self):
         self._fh = open(self.path, "w", newline="")
-        self._w = csvmod.writer(self._fh)
+        self._w = csv.writer(self._fh)
         self._fh.write(f"# session_epoch={time.time():.6f}\n")
         self._w.writerow(self.HEADER)
-    def write(self, row: List):
+    def write(self, row: List[Any]):
         if self._w: self._w.writerow(row)
     def close(self):
         try:
@@ -285,16 +261,13 @@ class CmdLogger:
         self._fh.write(f"# cmd log start {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
     def log(self, s: str):
         t = time.time()
-        try:
-            self._fh.write(f"{t:.6f} {s.strip()}\n")
-        except Exception:
-            pass
+        try: self._fh.write(f"{t:.6f} {s.strip()}\n")
+        except Exception: pass
     def close(self):
         try:
             self._fh.write(f"# cmd log end {time.strftime('%Y-%m-%d %H:%M:%S')} epoch={time.time():.6f}\n")
             self._fh.close()
-        except Exception:
-            pass
+        except Exception: pass
 
 @dataclass
 class PendingCmd:
@@ -303,18 +276,7 @@ class PendingCmd:
     recv_epoch: float
     recv_rel: float
 
-# ---------- FIFO ----------
-def ensure_fifo(path: str):
-    p = Path(path)
-    if p.exists():
-        st = p.stat()
-        if not stat.S_ISFIFO(st.st_mode):
-            try: p.unlink()
-            except Exception: pass
-            os.mkfifo(path)
-    else:
-        os.mkfifo(path)
-
+# ---------------- FIFO ----------------
 @dataclass
 class RawCmd:
     text: str
@@ -322,7 +284,6 @@ class RawCmd:
     recv_rel: float
 
 class FifoCommandServer:
-    """Non-blocking FIFO reader; enqueues RawCmd(text, recv_epoch, recv_rel)."""
     def __init__(self, path: str):
         self.path = path
         ensure_fifo(self.path)
@@ -363,7 +324,7 @@ class FifoCommandClient:
         print(f"[client:{bus}] Commands: id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help")
         waited=0.0
         while not Path(self.path).exists():
-            if waited==0.0: print(f"[client:{bus}] waiting for FIFO({self.path}) ... (start server or use --mode spawn)")
+            if waited==0.0: print(f"[client:{bus}] waiting for FIFO({self.path}) ... (start server)")
             time.sleep(0.2); waited+=0.2
             if waited>=10.0:
                 print(f"[client:{bus}] still waiting... creating FIFO locally.")
@@ -372,14 +333,14 @@ class FifoCommandClient:
         try:
             print(f"[client:{bus}] opening FIFO... (may wait until server opens reader)")
             print(f"  * 세션 폴더: {SESSION_DIR}")
-            print("  * 언제든 'help' 입력으로 사용법을 볼 수 있습니다.")
             with open(self.path,"w") as fw:
                 while True:
                     try: line = input(f"CMD[{bus}]> ").strip()
                     except (EOFError,KeyboardInterrupt): line="quit"
                     if not line: continue
                     if line.lower() in ("help","h","?"):
-                        print(help_text(bus_hint=bus)); continue
+                        print("id=.. K=.. B=.. pos=.. vel=.. tor=.. full=0|1 | start | end | stop | zero | quit | help")
+                        continue
                     fw.write(line+"\n"); fw.flush()
                     if line.lower() in ("quit","exit"):
                         print("bye"); break
@@ -387,32 +348,7 @@ class FifoCommandClient:
             print(f"[client:{bus}] error: {e}")
             input("Press Enter to close...")
 
-# ---------- 매핑 파서 ----------
-def parse_idmap_onebus(idmap: str, default_type: str) -> Dict[int, str]:
-    out: Dict[int,str] = {}
-    if not idmap: return out
-    for tok in idmap.split(","):
-        tok = tok.strip()
-        if not tok: continue
-        if ":" in tok:
-            i, t = tok.split(":",1)
-            out[int(i.strip())] = t.strip()
-        else:
-            out[int(tok)] = default_type
-    return out
-
-def parse_map_multibus(map_str: str, default_type: str) -> Dict[str, Dict[int, str]]:
-    out: Dict[str, Dict[int,str]] = {}
-    if not map_str: return out
-    for part in map_str.split(";"):
-        part = part.strip()
-        if not part: continue
-        if ":" not in part: raise ValueError(f"--map 형식 오류: {part}")
-        bus, ids = part.split(":",1)
-        out[bus.strip()] = parse_idmap_onebus(ids, default_type)
-    return out
-
-# ---------- 버스 서버 ----------
+# ---------------- MotorBusServer ----------------
 @dataclass
 class _MotorRuntime:
     mgr: "TMotorManager_mit_can"
@@ -424,23 +360,27 @@ class _MotorRuntime:
     pending: Optional[PendingCmd] = None
 
 class MotorBusServer:
-    def __init__(self, bus: str, id2type: Dict[int, str], hz: int):
+    def __init__(self, bus: str, id2type: Dict[int, str], hz: int, warmup_ticks: int = 20):
         if not TMOTOR_OK:
             raise RuntimeError(f"TMotorCANControl import 실패: {TMOTOR_IMPORT_ERR}")
         self.bus = bus
         self.id2type = id2type
-        self.hz = hz
-        self.scheduler = RealtimeScheduler(hz=self.hz)
+        self.scheduler = RealtimeScheduler(hz=hz)
+        self.warmup_ticks = int(warmup_ticks)
         self.stop_evt = threading.Event()
         self.q: "queue.Queue[RawCmd]" = queue.Queue()
         self.fifo = FifoCommandServer(fifo_path_for_bus(self.bus))
         self.parser = CommandParser()
         self.motors: Dict[int, _MotorRuntime] = {}
         self._status_last = 0.0
-        self._t0 = None  # perf base
+        self._t0 = None               # perf base
+        # Ready->Go handshake
+        self.ready_event = threading.Event()
+        self.ready_at_perf: Optional[float] = None
 
     def start(self):
         force_socketcan_channel(self.bus)
+        # init motors
         failed = []
         for mid, mtype in self.id2type.items():
             try:
@@ -453,23 +393,19 @@ class MotorBusServer:
                                    mtype=mtype)
                 self.motors[mid] = rt
             except Exception as e:
-                msg = str(e); failed.append((mid, mtype, msg))
-                print(f"[server:{self.bus}] init failed for id{mid}({mtype}): {msg}")
-                if "Device not connected" in msg:
-                    print("  → 전원/공통 GND/CAN-H/L/종단저항/ID/bitrate(1Mbps) 확인 및 라즈베리파이 저전압 경고 해결 필요")
+                failed.append((mid, mtype, str(e)))
+                print(f"[server:{self.bus}] init failed for id{mid}({mtype}): {e}")
         if not self.motors:
             reason = failed[0][2] if failed else "unknown"
             raise RuntimeError(f"No motors started on {self.bus}. First error: {reason}")
         if failed:
             human = ", ".join([f"id{mid}({t})" for mid, t, _ in failed])
-            print(f"[server:{self.bus}] WARNING: some motors failed to init: {human}")
-        print(f"[server:{self.bus}] ready. ids={list(self.motors.keys())}  (`help`는 클라이언트에서, `quit` 종료)")
+            print(f"[server:{self.bus}] WARNING: some motors failed: {human}")
+        print(f"[server:{self.bus}] ready to run. ids={list(self.motors.keys())}")
 
-    # 이벤트 스케줄: 다음 샘플 행에 기록
     def _schedule_event(self, mid: int, kind: str, text: str, recv_epoch: float, recv_rel: float):
         rt = self.motors.get(mid)
-        if not rt or not rt.rec_on or not rt.csv:
-            return
+        if not rt or not rt.rec_on or not rt.csv: return
         if rt.pending is None:
             rt.pending = PendingCmd(text=text, kind=kind, recv_epoch=recv_epoch, recv_rel=recv_rel)
         else:
@@ -477,15 +413,15 @@ class MotorBusServer:
             if rt.pending.kind != kind:
                 rt.pending.kind = "cmd"
             rt.pending.recv_epoch = min(rt.pending.recv_epoch, recv_epoch)
-            rt.pending.recv_rel   = min(rt.pending.recv_rel, recv_rel)
+            rt.pending.recv_rel   = min(rt.pending.recv_rel,  recv_rel)
 
     def _handle_action(self, cmd: Command, raw: 'RawCmd'):
         if cmd.mixed:
-            print("[server] 경고: action과 파라미터를 한 줄에 섞을 수 없습니다. (action만 수행)")
+            print("[server] 경고: action과 파라미터를 한 줄에 섞지 마세요. (action만 수행)")
         ids = cmd.ids
         if cmd.action == "start":
             for mid in ids:
-                rt = self.motors.get(mid); 
+                rt = self.motors.get(mid)
                 if not rt: continue
                 if not rt.csv:
                     rec = CsvRecorder(csv_path_for_motor(self.bus, mid)); rec.open()
@@ -502,11 +438,9 @@ class MotorBusServer:
                 if not rt or not rt.csv: continue
                 st = rt.ctrl.state()
                 latency_ms = (now_rel - raw.recv_rel) * 1000.0
-                rt.csv.write([
-                    f"{now_rel:.6f}", self.bus, mid, rt.mtype,
-                    st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
-                    "end", "end", f"{raw.recv_epoch:.6f}", f"{latency_ms:.3f}"
-                ])
+                rt.csv.write([f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                              st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                              "end", "end", f"{raw.recv_epoch:.6f}", f"{latency_ms:.3f}"])
                 rt.rec_on = False
                 if rt.csv: rt.csv.close(); rt.csv=None
                 if rt.cmdlog: rt.cmdlog.log("## END")
@@ -538,79 +472,79 @@ class MotorBusServer:
             return
 
     def _handle_non_action(self, cmd: Command, raw: 'RawCmd'):
-        # gains/full
         if cmd.gains or (cmd.full is not None):
             for mid in cmd.ids:
                 rt = self.motors.get(mid); 
                 if not rt: continue
                 rt.ctrl.apply_gains(cmd.gains.get("K"), cmd.gains.get("B"), cmd.full)
-        # setpoints
         if cmd.setp:
             for mid in cmd.ids:
                 rt = self.motors.get(mid); 
                 if not rt: continue
                 rt.ctrl.command(**cmd.setp)
-
-        # 이벤트 예약 (원문)
         for mid in cmd.ids:
             self._schedule_event(mid, "cmd", raw.text, raw.recv_epoch, raw.recv_rel)
-
-        # cmd log
         for mid in cmd.ids:
             rt = self.motors.get(mid)
             if rt and rt.cmdlog: rt.cmdlog.log(raw.text)
 
     def _print_status(self, t_now: float):
-        if (t_now - self._status_last) < 0.1:
-            return
-        status = []
+        if (t_now - self._status_last) < 0.1: return
+        status=[]
         for mid, rt in self.motors.items():
             st = rt.ctrl.state()
             rec = "R" if rt.rec_on and rt.csv else "-"
-            status.append(
-                f"[{rec}] id{mid}({rt.mtype}): "
-                f"pos={_fmtf(st['pos'])} vel={_fmtf(st['vel'])} tor={_fmtf(st['torque'],'{:+.2f}')} "
-                f"T={_fmtf(st['temp'],'{:.1f}')} err={st['err']}"
-            )
+            status.append(f"[{rec}] id{mid}({rt.mtype}): pos={_fmtf(st['pos'])} vel={_fmtf(st['vel'])} "
+                          f"tor={_fmtf(st['torque'],'{:+.2f}')} T={_fmtf(st['temp'],'{:.1f}')} err={st['err']}")
         print("\r" + " | ".join(status) + "   ", end="", flush=True)
         self._status_last = t_now
 
     def run(self):
         self.start()
         self._t0 = time.perf_counter()
+        # FIFO reader thread
         th = threading.Thread(target=self.fifo.reader_thread, args=(self.q, self.stop_evt, self._t0), daemon=True)
         th.start()
+
+        ticks = 0
         try:
             while not self.stop_evt.is_set():
                 _ = self.scheduler.tick()
-                # 제어 업데이트 + CSV 기록
                 now_rel = time.perf_counter() - self._t0
+
+                # Warm-up (READY) -------------------------------------------------
+                if not self.ready_event.is_set():
+                    ticks += 1
+                    if ticks >= self.warmup_ticks:
+                        self.ready_at_perf = time.perf_counter()
+                        self.ready_event.set()
+                        print(f"\n[server:{self.bus}] READY after {ticks} ticks "
+                              f"(~{ticks*self.scheduler.dt:.3f}s).")
+
+                # Tick + CSV write -----------------------------------------------
                 for mid, rt in self.motors.items():
                     rt.ctrl.tick()
                     if rt.rec_on and rt.csv:
                         st = rt.ctrl.state()
                         if rt.pending:
                             latency_ms = (now_rel - rt.pending.recv_rel) * 1000.0
-                            row = [
-                                f"{now_rel:.6f}", self.bus, mid, rt.mtype,
-                                st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
-                                rt.pending.text, rt.pending.kind, f"{rt.pending.recv_epoch:.6f}", f"{latency_ms:.3f}"
-                            ]
+                            row = [f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                                   st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                                   rt.pending.text, rt.pending.kind,
+                                   f"{rt.pending.recv_epoch:.6f}", f"{latency_ms:.3f}"]
                             rt.pending = None
                         else:
-                            row = [
-                                f"{now_rel:.6f}", self.bus, mid, rt.mtype,
-                                st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
-                                "", "", "", ""
-                            ]
+                            row = [f"{now_rel:.6f}", self.bus, mid, rt.mtype,
+                                   st["pos"], st["vel"], st["acc"], st["torque"], st["temp"], st["err"],
+                                   "", "", "", ""]
                         rt.csv.write(row)
 
-                # 커맨드 처리
+                # Command queue ---------------------------------------------------
                 try:
                     while True:
                         raw = self.q.get_nowait()
                         cmd = self.parser.parse(raw.text, id_pool=list(self.motors.keys()))
-                        if cmd is None: 
+                        if cmd is None:
                             continue
                         if cmd.action == "quit":
                             self.stop_evt.set(); break
@@ -635,507 +569,259 @@ class MotorBusServer:
                 rt.ctrl.zero()
                 if rt.csv: rt.csv.close()
                 if rt.cmdlog: rt.cmdlog.close()
-            except Exception:
-                pass
+            except Exception: pass
         for mid, rt in self.motors.items():
             try: rt.mgr.__exit__(None,None,None)
             except Exception: pass
         print(f"\n[server:{self.bus}] exit.")
 
-# ---------- 시나리오: 데이터 구조 ----------
+# ---------------- Scenario Loader & Runner ----------------
+# YAML/JSON 로더
+def _load_yaml_or_json(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in (".yaml",".yml"):
+        try:
+            import yaml
+        except Exception:
+            raise RuntimeError("PyYAML이 필요합니다: pip install pyyaml")
+        return yaml.safe_load(text)
+    import json
+    return json.loads(text)
+
 @dataclass
 class ScheduledAction:
     t_abs: float
-    action: str                       # 'apply_gains' | 'move' | 'vel' | 'torque' | 'hold' | 'start_record' | 'end_record' | 'safe_zero' | 'stop' | 'play_sources'
+    action: str
     ids: List[int]
     params: Dict[str, Any]
-    raw_note: Optional[str] = None
-
-@dataclass
-class CsvSourceSpec:
-    file: str
-    id: int
-    col_t: str = "time_s"             # CSV 헤더명: 시간 컬럼
-    col_pos: Optional[str] = None     # CSV 헤더명: 위치
-    col_vel: Optional[str] = None     # CSV 헤더명: 속도
-    col_tor: Optional[str] = None     # CSV 헤더명: 토크
-    time_unit: str = "s"              # "s" | "ms"
-    downsample_hz: Optional[float] = None
-    offset_s: float = 0.0
-
-@dataclass
-class ScenarioSpec:
-    name: str
-    rate_hz: int
-    actions: List[ScheduledAction]
-    sources: List[CsvSourceSpec] = field(default_factory=list)
-
-# ---------- 시나리오: 로더 ----------
-try:
-    import yaml  # PyYAML
-    HAVE_YAML = True
-except Exception:
-    HAVE_YAML = False
+    note: str = ""
 
 class ScenarioLoader:
-    ALLOWED_ACTIONS = {
-        "apply_gains", "move", "vel", "torque",
-        "hold", "start_record", "end_record", "safe_zero", "stop",
-        "play_sources"
-    }
+    def __init__(self, path: str, id_pool: List[int]):
+        # 경로 보정: 절대가 아니면 BASE_DIR 기준
+        p = Path(path)
+        if not p.is_absolute():
+            p2 = (BASE_DIR / path).resolve()
+            p = p2 if p2.exists() else p
+        if not p.exists():
+            raise FileNotFoundError(f"scenario not found: {p}")
+        self.raw = _load_yaml_or_json(p)
+        self.id_pool = id_pool
+        self.steps: List[ScheduledAction] = []
+        self.sources: List[dict] = []
 
-    def load(self, path: str, id_pool: List[int]) -> ScenarioSpec:
-        doc = self._read_any(path)
-        name = str(doc.get("name", "unnamed"))
-        rate_hz = int(doc.get("rate_hz", 200))
-
-        groups = doc.get("groups", {}) or {}
-        defaults = doc.get("defaults", {}) or {}
-        steps = doc.get("steps", []) or []
-        sources_doc = doc.get("sources", []) or []
-
-        # 그룹 확장
-        def expand_targets(tgt: Union[str, int, List[Union[str,int]]]) -> List[int]:
-            if isinstance(tgt, (int, str)):
-                tgt = [tgt]
-            out: List[int] = []
-            for item in tgt:
-                if isinstance(item, int):
-                    out.append(item)
-                elif isinstance(item, str):
-                    if item in groups:
-                        out.extend(int(x) for x in groups[item])
-                    else:
-                        out.append(int(item))
-                else:
-                    raise ValueError(f"Unsupported target entry: {item}")
-            out = [i for i in out if i in id_pool]
-            if not out:
-                raise ValueError(f"targets '{tgt}' expand to empty set (unknown ids?)")
-            return sorted(set(out))
-
-        # 시간 정규화
-        actions: List[ScheduledAction] = []
-        t_cursor = 0.0
-        for s in steps:
-            s = dict(s)
-            if "action" not in s:
-                raise ValueError(f"step missing 'action': {s}")
-            act = str(s["action"]).strip()
-            if act not in self.ALLOWED_ACTIONS:
-                raise ValueError(f"unsupported action: {act}")
-
-            if "at" in s and "after" in s:
-                raise ValueError("Use either 'at' or 'after', not both.")
-            if "at" in s:
-                t_abs = float(s["at"])
-                t_cursor = t_abs
-            elif "after" in s:
-                t_cursor += float(s["after"])
-                t_abs = t_cursor
-            else:
-                t_abs = t_cursor
-
-            # targets: play_sources는 targets 없이 동작(소스 ID에 따름)
+    def _expand_targets(self, spec_targets: Any, groups: Dict[str, List[int]]) -> List[int]:
+        if spec_targets is None:
+            return []
+        if isinstance(spec_targets, (list,tuple)):
             ids = []
-            if act != "play_sources":
-                targets = s.get("targets", None)
-                if targets is None:
-                    raise ValueError("step missing 'targets'")
-                ids = expand_targets(targets)
+            for x in spec_targets:
+                if isinstance(x, int):
+                    ids.append(x)
+                elif isinstance(x, str) and x in groups:
+                    ids += groups[x]
+            return sorted([i for i in ids if i in self.id_pool])
+        if isinstance(spec_targets, str) and spec_targets in groups:
+            return [i for i in groups[spec_targets] if i in self.id_pool]
+        if isinstance(spec_targets, int):
+            return [spec_targets] if spec_targets in self.id_pool else []
+        return []
 
-            # 파라미터 병합(게인 기본값)
-            params = {}
-            if act == "apply_gains":
-                base = (defaults.get("gains") or {})
-                p = s.get("params") or {}
-                params.update(base)
-                params.update(p)
-                if "full_state" in params:
-                    params["full_state"] = 1 if params["full_state"] else 0
+    def normalize(self) -> List[ScheduledAction]:
+        name = self.raw.get("name","scenario")
+        defaults = self.raw.get("defaults", {})
+        def_gains = defaults.get("gains", {})
+        groups = self.raw.get("groups", {})
+        # groups의 값이 문자열 키면 숫자 리스트로 강제
+        groups2 = {}
+        for k,v in groups.items():
+            if isinstance(v, (list,tuple)):
+                groups2[k] = [int(x) for x in v if isinstance(x,int) or str(x).isdigit()]
+        steps_raw = self.raw.get("steps", [])
+        t_cursor = 0.0
+        out: List[ScheduledAction] = []
+        for i, st in enumerate(steps_raw):
+            # 블록/플로우 모두 지원
+            at   = st.get("at", None)
+            after= st.get("after", None)
+            if at is not None and after is not None:
+                raise ValueError(f"step#{i}: 'at'와 'after'를 동시에 쓸 수 없음")
+            if at is not None:
+                t_abs = float(at)
+                t_cursor = t_abs
             else:
-                params.update(s.get("params") or {})
+                dt = float(after or 0.0)
+                t_cursor += dt
+                t_abs = t_cursor
+            action = st.get("action")
+            targets = self._expand_targets(st.get("targets"), groups2)
+            params  = dict(st.get("params", {}))
+            if action == "apply_gains":
+                # defaults 병합
+                for k in ("K","B","full_state"):
+                    if k not in params and k in def_gains:
+                        params[k] = def_gains[k]
+            out.append(ScheduledAction(t_abs=t_abs, action=action, ids=targets, params=params))
+        self.steps = out
+        self.sources = self.raw.get("sources", [])
+        print(f"[scenario] loaded '{name}', steps={len(out)}, sources={len(self.sources)}")
+        return out
 
-            actions.append(ScheduledAction(
-                t_abs=float(t_abs),
-                action=act,
-                ids=ids,
-                params=params,
-                raw_note=s.get("note")
-            ))
-
-        actions.sort(key=lambda a: a.t_abs)
-
-        # CSV sources 해석 (파일 존재 체크는 Runner에서 수행 가능)
-        sources: List[CsvSourceSpec] = []
-        for ent in sources_doc:
-            ent = dict(ent)
-            file = str(ent["file"])
-            sid = int(ent["id"])
-            cols = ent.get("columns", {}) or {}
-            src = CsvSourceSpec(
-                file=file, id=sid,
-                col_t   = cols.get("t", "time_s"),
-                col_pos = cols.get("pos", None),
-                col_vel = cols.get("vel", None),
-                col_tor = cols.get("tor", None),
-                time_unit = ent.get("time_unit", "s"),
-                downsample_hz = ent.get("downsample_hz", None),
-                offset_s = float(ent.get("offset_s", 0.0)),
-            )
-            sources.append(src)
-
-        return ScenarioSpec(name=name, rate_hz=rate_hz, actions=actions, sources=sources)
-
-    def _read_any(self, path: str) -> Dict[str, Any]:
-        with open(path, "r", encoding="utf-8") as f:
-            txt = f.read()
-        txt_stripped = txt.lstrip()
-        if HAVE_YAML and (path.endswith(".yaml") or path.endswith(".yml")):
-            return yaml.safe_load(txt) or {}
-        if txt_stripped.startswith("{") or txt_stripped.startswith("[") or path.endswith(".json"):
-            return json.loads(txt)
-        raise RuntimeError("Install PyYAML or provide JSON file.")
-
-# ---------- 시나리오: 러너 ----------
-class ScenarioRunner:
+class ScenarioRunner(threading.Thread):
     """
-    - 서버 내부 큐(server.q)에 RawCmd 텍스트를 주입하여 기존 파서/핸들러를 재사용
-    - play_sources: YAML 'sources'에서 CSV를 읽어 시간/ID별 명령을 사전 컴파일
+    - 서버 ready_event.wait() 후 실행
+    - 첫 스텝은 start_offset_s 만큼 밀어줌
+    - 히스테리시스(= dt/2) 적용: now + dt/2 < t_abs 일 때만 대기
     """
-    def __init__(self, spec: ScenarioSpec, server: MotorBusServer):
-        self.spec = spec
+    def __init__(self, server: MotorBusServer, loader: ScenarioLoader,
+                 start_offset_s: float = 0.20, debug: bool=False):
+        super().__init__(daemon=True)
         self.server = server
-        self._compiled: List[Tuple[float, List[str]]] = []   # (t_abs, [cmd_text,...])
+        self.loader = loader
+        self.start_offset_s = float(start_offset_s)
+        self.debug = debug
+        self._compiled: List[Tuple[float, List[str]]] = []  # (t_abs, [cmdline...])
 
-    # ----- 내부 유틸 -----
-    def _enqueue_text(self, text: str):
-        now_epoch = time.time()
-        now_rel = 0.0
-        if getattr(self.server, "_t0", None) is not None:
-            now_rel = time.perf_counter() - self.server._t0
-        self.server.q.put(RawCmd(text=text, recv_epoch=now_epoch, recv_rel=now_rel))
+    def _emit_for_ids(self, t: float, ids: List[int], text: str):
+        self._compiled.append((t, [f"id={i} {text}" for i in ids]))
 
-    # CSV 소스 읽어 (t_abs → 명령리스트) 스케줄로 컴파일
-    def _compile_sources(self, play_at: float, params: Dict[str, Any]):
-        """
-        params:
-          align: "relative"(default) | "absolute"
-          clamp_to_limits: bool (현재 버전은 서버 측 한계 가드 없음 → 생략)
-        """
-        align = str(params.get("align", "relative")).lower()
-        # downsample 기본: 서버 루프의 절반 정도로 제한(너무 촘촘한 명령 주입 방지)
-        default_ds_hz = min(self.server.hz, 100)
-
-        sched_map: Dict[float, List[str]] = {}
-        for src in self.spec.sources:
-            # CSV 로드
-            p = Path(src.file)
-            if not p.is_absolute():
-                p = (BASE_DIR / src.file).resolve()
-            if not p.exists():
-                print(f"[scenario] CSV not found: {p}")
-                continue
-
-            # 다운샘플 간격
-            ds_hz = float(src.downsample_hz) if src.downsample_hz else float(default_ds_hz)
-            ds_dt = 1.0 / max(1.0, ds_hz)
-
-            last_emit_t = None
-            with open(p, "r", encoding="utf-8") as f:
-                rdr = csvmod.DictReader(f)
-                for row in rdr:
-                    # 시간
-                    try:
-                        t_val = float(row[src.col_t])
-                    except Exception:
-                        continue
-                    if src.time_unit == "ms":
-                        t_rel = t_val * 1e-3
-                    else:
-                        t_rel = t_val
-                    t_rel += src.offset_s
-                    t_abs = (play_at + t_rel) if (align != "absolute") else t_rel
-
-                    # 다운샘플
-                    if last_emit_t is None or (t_abs - last_emit_t) >= ds_dt - 1e-9:
-                        # 값들 조합
-                        parts = [f"id={src.id}"]
-                        has_any = False
-                        if src.col_pos and row.get(src.col_pos, "") != "":
-                            parts.append(f"pos={row[src.col_pos]}")
-                            has_any = True
-                        if src.col_vel and row.get(src.col_vel, "") != "":
-                            parts.append(f"vel={row[src.col_vel]}")
-                            has_any = True
-                        if src.col_tor and row.get(src.col_tor, "") != "":
-                            parts.append(f"tor={row[src.col_tor]}")
-                            has_any = True
-                        if not has_any:
-                            # 값이 하나도 없으면 skip
-                            last_emit_t = t_abs
-                            continue
-
-                        cmd = " ".join(parts)
-                        sched_map.setdefault(t_abs, []).append(cmd)
-                        last_emit_t = t_abs
-
-        # 합치고 정렬
-        items = sorted(sched_map.items(), key=lambda kv: kv[0])
-        self._compiled.extend(items)
-
-    # 스케줄(steps + sources) 전체 컴파일
-    def _compile_all(self):
-        self._compiled = []
-        for a in self.spec.actions:
-            if a.action == "hold":
-                # hold는 명령이 아니라 시간 경과만 의미 → 별도 항목 불필요
-                continue
-            elif a.action == "apply_gains":
-                K = a.params.get("K", None)
-                B = a.params.get("B", None)
-                full = a.params.get("full_state", None)
-                for mid in a.ids:
-                    parts = [f"id={mid}"]
-                    if K is not None: parts.append(f"K={K}")
-                    if B is not None: parts.append(f"B={B}")
-                    if full is not None: parts.append(f"full={int(full)}")
-                    self._compiled.append((a.t_abs, [" ".join(parts)]))
-            elif a.action == "move":
-                pos = a.params.get("pos", None)
-                if pos is None: continue
-                cmds = [f"id={mid} pos={pos}" for mid in a.ids]
-                self._compiled.append((a.t_abs, cmds))
-            elif a.action == "vel":
-                vel = a.params.get("vel", None)
-                if vel is None: continue
-                cmds = [f"id={mid} vel={vel}" for mid in a.ids]
-                self._compiled.append((a.t_abs, cmds))
-            elif a.action == "torque":
-                tor = a.params.get("torque", None)
-                if tor is None: continue
-                cmds = [f"id={mid} tor={tor}" for mid in a.ids]
-                self._compiled.append((a.t_abs, cmds))
-            elif a.action == "start_record":
-                cmds = [f"id={mid} start" for mid in a.ids]
-                self._compiled.append((a.t_abs, cmds))
-            elif a.action == "end_record":
-                cmds = [f"id={mid} end" for mid in a.ids]
-                self._compiled.append((a.t_abs, cmds))
-            elif a.action == "safe_zero":
-                dwell = float(a.params.get("dwell_s", 0.05))
-                pre_cmds = []
-                for mid in a.ids:
-                    pre_cmds.append(f"id={mid} K=0 B=0")
-                    pre_cmds.append(f"id={mid} vel=0 tor=0")
-                self._compiled.append((a.t_abs, pre_cmds))
-                # zero는 dwell 후에
-                self._compiled.append((a.t_abs + dwell, [f"id={mid} zero" for mid in a.ids]))
-            elif a.action == "stop":
-                self._compiled.append((a.t_abs, [f"id={mid} stop" for mid in a.ids]))
-            elif a.action == "play_sources":
-                # sources를 현재 a.t_abs를 기준으로 컴파일
-                self._compile_sources(play_at=a.t_abs, params=a.params or {})
+    def compile(self):
+        self._compiled.clear()
+        steps = self.loader.normalize()
+        # steps -> cmd text
+        for s in steps:
+            if s.action == "start_record":
+                self._emit_for_ids(s.t_abs, s.ids, "start")
+            elif s.action == "end_record":
+                self._emit_for_ids(s.t_abs, s.ids, "end")
+            elif s.action == "apply_gains":
+                K = s.params.get("K"); B = s.params.get("B")
+                full = s.params.get("full_state", True)
+                parts = []
+                if K is not None: parts.append(f"K={float(K)}")
+                if B is not None: parts.append(f"B={float(B)}")
+                parts.append(f"full={1 if bool(full) else 0}")
+                self._emit_for_ids(s.t_abs, s.ids, " ".join(parts))
+            elif s.action in ("move","vel","torque"):
+                parts=[]
+                if s.action=="move" and "pos" in s.params:
+                    parts.append(f"pos={float(s.params['pos'])}")
+                if s.action=="vel" and "vel" in s.params:
+                    parts.append(f"vel={float(s.params['vel'])}")
+                if s.action=="torque" and "torque" in s.params:
+                    parts.append(f"tor={float(s.params['torque'])}")
+                if parts:
+                    self._emit_for_ids(s.t_abs, s.ids, " ".join(parts))
+            elif s.action == "safe_zero":
+                dwell = float(s.params.get("dwell_s", 0.05))
+                # 1) K/B=0 + vel/tor=0
+                self._emit_for_ids(s.t_abs, s.ids, "K=0 B=0")
+                self._emit_for_ids(s.t_abs, s.ids, "vel=0.0 tor=0.0")
+                # 2) zero
+                self._emit_for_ids(s.t_abs + dwell, s.ids, "zero")
+            elif s.action == "stop":
+                self._emit_for_ids(s.t_abs, s.ids, "stop")
+            elif s.action == "hold":
+                pass  # 시간만 전진
             else:
-                # 미지원 액션은 무시
-                pass
+                print(f"[scenario] WARN: unsupported action '{s.action}' (ignored)")
 
-        # 최종 정렬(동시간 다수 명령은 입력 순서를 대략 유지)
-        self._compiled.sort(key=lambda item: item[0])
+        # 정렬 & 병합(같은 시각 끼리는 그대로 순서 유지)
+        self._compiled.sort(key=lambda x: x[0])
 
-    # 러너 실행(별도 스레드)
-    def play(self):
-        # 서버 루프 기준시각 준비 대기
-        while getattr(self.server, "_t0", None) is None:
-            time.sleep(0.01)
+    def run(self):
+        # 서버 준비 대기
+        self.server.ready_event.wait()
+        ready_perf = self.server.ready_at_perf or time.perf_counter()
+        # 시작 오프셋
+        offset = self.start_offset_s
+        dt = self.server.scheduler.dt
+        hysteresis = 0.5 * dt
 
-        self._compile_all()
+        # 시점 보정
+        timeline = [(t + offset, cmds) for (t,cmds) in self._compiled]
 
-        t0 = self.server._t0
-        idx = 0
-        N = len(self._compiled)
-        while idx < N:
-            t_abs, cmds = self._compiled[idx]
-            now_rel = time.perf_counter() - t0
-            dt = t_abs - now_rel
-            if dt > 0:
-                time.sleep(min(dt, 0.01))
+        if self.debug:
+            print("\n[scenario] --- COMPILED SCHEDULE ---")
+            for t,cmds in timeline:
+                for c in cmds:
+                    print(f"  t={t:.3f}s : {c}")
+            print("[scenario] --------------------------")
+
+        # 재생
+        while timeline and not self.server.stop_evt.is_set():
+            now = time.perf_counter() - (self.server._t0 or ready_perf)
+            t_abs, cmds = timeline[0]
+            if now + hysteresis < t_abs:
+                time.sleep(min(0.01, max(0.0, t_abs - now - hysteresis)))
                 continue
-            for c in cmds:
-                self._enqueue_text(c)
-            idx += 1
+            # enqueue
+            recv_epoch = time.time()
+            recv_rel   = time.perf_counter() - (self.server._t0 or ready_perf)
+            for text in cmds:
+                self.server.q.put(RawCmd(text=text, recv_epoch=recv_epoch, recv_rel=recv_rel))
+                if self.debug:
+                    print(f"[scenario] enqueue @ {now:.3f}s (target {t_abs:.3f}s): {text}")
+            timeline.pop(0)
 
-        # 끝나면 로그 한 줄(선택)
-        # self._enqueue_text(f"# scenario '{self.spec.name}' completed")
+# ---------------- Parsing helpers ----------------
+def parse_idmap_onebus(idmap: str, default_type: str) -> Dict[int, str]:
+    out: Dict[int,str] = {}
+    if not idmap: return out
+    for tok in idmap.split(","):
+        tok = tok.strip()
+        if not tok: continue
+        if ":" in tok:
+            i, t = tok.split(":",1)
+            out[int(i.strip())] = t.strip()
+        else:
+            out[int(tok)] = default_type
+    return out
 
-# ---------- spawn/setup/cli ----------
-def find_terminal():
-    import shutil
-    for term in ("lxterminal","xterm","gnome-terminal","xfce4-terminal","mate-terminal"):
-        if shutil.which(term):
-            return term
-    return None
+# ---------------- CLI ----------------
+def run_server(bus: str, id2type: Dict[int, str], hz: int,
+               scenario_path: Optional[str], scenario_debug: bool,
+               start_offset_s: float):
+    set_session_tag(None)
+    server = MotorBusServer(bus, id2type, hz)
+    # 시나리오 지정 시: 로더/러너 준비(스레드)
+    runner = None
+    if scenario_path:
+        loader = ScenarioLoader(scenario_path, id_pool=list(id2type.keys()))
+        runner = ScenarioRunner(server, loader, start_offset_s=start_offset_s, debug=scenario_debug)
+        runner.compile()
+        runner.start()  # 내부에서 ready_event.wait()
 
-def wrap_in_shell(cmd: str) -> str:
-    return f"bash -lc {shlex.quote(cmd)}"
+    try:
+        server.run()
+    finally:
+        if runner and runner.is_alive():
+            server.stop_evt.set()
+            runner.join(timeout=1.0)
 
 def run_client(bus: str):
-    fifo = fifo_path_for_bus(bus)
-    FifoCommandClient(fifo).run(bus)
+    set_session_tag(None)
+    FifoCommandClient(fifo_path_for_bus(bus)).run(bus)
 
-def run_spawn(mapping: Dict[str, Dict[int,str]], hz: int, tag: Optional[str] = None):
-    if tag is None:
-        tag = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
-    set_session_tag(tag)
-
-    term = find_terminal()
-    if not term:
-        print("No terminal emulator found. Install lxterminal/xterm/gnome-terminal.")
-        sys.exit(1)
-
-    script_path = str((BASE_DIR / Path(__file__).name).resolve())
-    py = f"{shlex.quote(sys.executable)} -u {shlex.quote(script_path)}"
-
-    for bus, id2type in mapping.items():
-        idmap_str = ",".join(f"{i}:{t}" for i,t in id2type.items())
-
-        server_log = SESSION_DIR / f"server_{bus}.log"
-        client_log = SESSION_DIR / f"client_{bus}.log"
-
-        server_cmd = (
-            f"{py} --mode server --session-tag {shlex.quote(tag)} "
-            f"--bus {bus} --idmap {shlex.quote(idmap_str)} --hz {hz} "
-            f"2>&1 | tee {shlex.quote(str(server_log))}"
-        )
-        client_cmd = (
-            f"{py} --mode client --session-tag {shlex.quote(tag)} "
-            f"--bus {bus} "
-            f"2>&1 | tee {shlex.quote(str(client_log))}"
-        )
-        hold_tail = '; echo; echo "[press Enter to close]"; read -r _'
-
-        if term=="lxterminal":
-            os.system(f'lxterminal -t "Motor Output {bus}" -e {wrap_in_shell(server_cmd + hold_tail)} &')
-            time.sleep(0.6)
-            os.system(f'lxterminal -t "Motor Input {bus}"  -e {wrap_in_shell(client_cmd + hold_tail)} &')
-        elif term=="xterm":
-            os.system(f'xterm -T "Motor Output {bus}" -hold -e {wrap_in_shell(server_cmd)} &')
-            time.sleep(0.6)
-            os.system(f'xterm -T "Motor Input {bus}"  -hold -e {wrap_in_shell(client_cmd)} &')
-        else:
-            os.system(f'gnome-terminal --title="Motor Output {bus}" -- bash -lc {shlex.quote(server_cmd + hold_tail)} &')
-            time.sleep(0.6)
-            os.system(f'gnome-terminal --title="Motor Input {bus}"  -- bash -lc {shlex.quote(client_cmd + hold_tail)} &')
-
-def run_setup(default_hz: int):
-    print("# Setup Wizard (세션 폴더 방식, spawn에서 생성)")
-    print("버스/ID/타입 입력 → 주파수 설정 → spawn 자동 실행")
-    mapping: Dict[str, Dict[int,str]] = {}
-    while True:
-        line = input("버스 입력 (예: can0: 1 AK70-10, 2 AK80-64) > ").strip()
-        if not line: break
-        if ":" not in line:
-            print("형식: canX: ID TYPE[, ID TYPE ...]"); continue
-        bus, rest = line.split(":",1)
-        bus = bus.strip()
-        pairs = {}
-        for seg in rest.split(","):
-            seg = seg.strip()
-            if not seg: continue
-            parts = seg.split()
-            if len(parts)<2:
-                print(f"  항목 형식 오류: {seg}  (ID TYPE)"); continue
-            try:
-                mid = int(parts[0]); mtype = parts[1]
-            except Exception:
-                print(f"  항목 형식 오류: {seg}"); continue
-            pairs[mid] = mtype
-        if not pairs:
-            print("  유효한 ID TYPE 쌍이 없습니다."); continue
-        mapping[bus] = pairs
-
-    if not mapping:
-        print("설정이 비어 있습니다. 종료."); return
-
-    print("\n## 설정 요약")
-    for bus, mp in mapping.items():
-        print(f"  {bus}: " + ", ".join(f"{i}:{t}" for i,t in mp.items()))
-    try:
-        hz = int(input(f"제어 주기 Hz 입력 (기본 {default_hz}) > ").strip() or str(default_hz))
-    except Exception:
-        hz = default_hz
-
-    print("\n[안내] 한 세션용 폴더를 만들고, 버스별 서버/클라이언트를 자동으로 띄웁니다.")
-    yn = input("이 설정으로 spawn 할까요? [Y/n] ").strip().lower()
-    if yn in ("", "y", "yes"):
-        run_spawn(mapping, hz)
-    else:
-        print("취소됨.")
-
-# ---------- main ----------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=("server","client","spawn","setup"), default="setup")
-    p.add_argument("--hz", type=int, default=200)
+    p.add_argument("--mode", choices=("server","client"), default="server")
     p.add_argument("--bus", default="can0")
-    p.add_argument("--idmap", default="", help='server: "1:AK70-10,2:AK80-64"')
-    p.add_argument("--map", default="",  help='spawn: "can0:1:AK70-10,2:AK80-64;can1:3:AK80-64"')
-    p.add_argument("--session-tag", default=None, help="세션 태그 고정(부모 spawn에서 전달)")
-    # 시나리오 옵션
-    p.add_argument("--scenario", default=None, help="시나리오 파일 경로(.yaml/.yml/.json)")
+    p.add_argument("--idmap", default="", help='예: "1:AK80-64,2:AK70-10"')
+    p.add_argument("--hz", type=int, default=200)
+    p.add_argument("--scenario", default=None, help="시나리오 파일(.yaml/.yml/.json)")
+    p.add_argument("--scenario-debug", action="store_true")
+    p.add_argument("--start-offset", type=float, default=0.20, help="시나리오 자동 시작 오프셋(초)")
     args = p.parse_args()
-
-    # 세션 폴더 생성 시점
-    if args.mode == "server":
-        set_session_tag(args.session_tag)
-    elif args.mode == "client":
-        set_session_tag(args.session_tag)
-    elif args.mode == "spawn":
-        pass
-    elif args.mode == "setup":
-        pass
-
-    if args.mode == "setup":
-        run_setup(args.hz); return
-
-    if args.mode == "spawn":
-        mapping = parse_map_multibus(args.map, default_type="AK70-10")
-        if not mapping:
-            id2type = parse_idmap_onebus(args.idmap, default_type="AK70-10")
-            if not id2type:
-                print('spawn 모드: --map 또는 (--bus 와 --idmap "1:AK70-10,2:AK80-64") 필요'); sys.exit(2)
-            mapping = {args.bus: id2type}
-        run_spawn(mapping, args.hz, tag=args.session_tag); return
 
     if args.mode == "client":
         run_client(args.bus); return
 
-    # server
     id2type = parse_idmap_onebus(args.idmap, default_type="AK70-10")
     if not id2type:
         print('server 모드: --idmap "1:AK70-10,2:AK80-64" 필요'); sys.exit(2)
 
-    try:
-        server = MotorBusServer(args.bus, id2type, args.hz)
-
-        # 시나리오가 지정되면 로드 후 러너 스레드 기동
-        if args.scenario:
-            try:
-                loader = ScenarioLoader()
-                spec = loader.load(args.scenario, id_pool=list(id2type.keys()))
-                runner = ScenarioRunner(spec, server)
-                th = threading.Thread(target=runner.play, daemon=True)
-                th.start()
-                print(f"[scenario] loaded '{spec.name}' and started runner thread.")
-            except Exception as e:
-                print("[scenario] load error:", e)
-
-        server.run()
-    except KeyboardInterrupt:
-        print("\n[server] KeyboardInterrupt")
-    except Exception as e:
-        print("[server] fatal:", e)
-        sys.exit(1)
+    run_server(args.bus, id2type, args.hz, args.scenario, args.scenario_debug, args.start_offset)
 
 if __name__ == "__main__":
     main()
