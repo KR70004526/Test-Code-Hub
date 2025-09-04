@@ -1,0 +1,12 @@
+name: basic_step_move
+rate_hz: 200
+groups: { pair: [1, 2] }
+defaults: { gains: { K: 8.0, B: 0.2, full_state: true } }
+
+steps:
+  - at: 0.00 , action: start_record , targets: pair
+  - after: 0.05, action: apply_gains , targets: pair        # K/B/full 적용
+  - after: 0.05, action: safe_zero   , targets: pair, params: { dwell_s: 0.05 }
+  - after: 0.00, action: move        , targets: pair, params: { pos: 0.6 }
+  - after: 2.00, action: move        , targets: pair, params: { pos: 0.0 }
+  - after: 2.00, action: end_record  , targets: pair

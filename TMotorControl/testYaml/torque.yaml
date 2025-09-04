@@ -1,0 +1,17 @@
+name: torque_pulse
+rate_hz: 200
+groups: { pair: [1, 2] }
+defaults: { gains: { K: 0.0, B: 0.0, full_state: true } }  # 토크 명령이므로 게인 0
+
+steps:
+  - at: 0.00 , action: start_record , targets: pair
+  - after: 0.05, action: apply_gains , targets: pair
+  - after: 0.05, action: safe_zero   , targets: pair, params: { dwell_s: 0.05 }
+
+  - after: 0.00, action: torque , targets: pair, params: { torque:  0.0 }
+  - after: 0.10, action: torque , targets: pair, params: { torque:  1.5 }
+  - after: 0.50, action: torque , targets: pair, params: { torque:  0.0 }
+  - after: 0.50, action: torque , targets: pair, params: { torque: -1.5 }
+  - after: 0.50, action: torque , targets: pair, params: { torque:  0.0 }
+
+  - after: 0.50, action: end_record  , targets: pair

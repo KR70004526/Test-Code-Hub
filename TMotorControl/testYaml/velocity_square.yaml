@@ -1,0 +1,16 @@
+name: velocity_square_wave
+rate_hz: 200
+groups: { pair: [1, 2] }
+defaults: { gains: { K: 4.0, B: 0.08, full_state: true } }
+
+steps:
+  - at: 0.00 , action: start_record , targets: pair
+  - after: 0.05, action: apply_gains , targets: pair
+  - after: 0.05, action: safe_zero   , targets: pair, params: { dwell_s: 0.05 }
+
+  - after: 0.00, action: vel , targets: pair, params: { vel:  0.8 }
+  - after: 1.00, action: vel , targets: pair, params: { vel: -0.8 }
+  - after: 1.00, action: vel , targets: pair, params: { vel:  0.8 }
+  - after: 1.00, action: vel , targets: pair, params: { vel:  0.0 }
+
+  - after: 0.50, action: end_record  , targets: pair
